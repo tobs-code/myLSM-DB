@@ -190,6 +190,10 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `tx.find(collection, field, FindOp)` | v0.4: Index-Abfrage inkl. eigener uncommitteter Writes. |
 | `tx.commit()` | v0.4: committet atomar (WAL `Begin`→`TxPut`/`TxDelete`→`Commit`, fsync, dann MemTable). |
 | `tx.abort()` | v0.4: verwirft alle uncommitteten Writes (schreibt nichts Persistentes). |
+| `store.query(collection)?` | v0.5: erzeugt einen `QueryBuilder` (filter/sort/limit). |
+| `builder.filter(pred)` / `.sort(field, dir)` / `.limit(n)` | v0.5: kettet Bedingungen an (jeweils `Self`). |
+| `store.execute_query(builder)?` | v0.5: führt den Plan aus, liefert `Vec<(String, Entity)>`. |
+| `store.explain_query(&builder)?` | v0.5: zeigt den geplanten Physical-Plan als Baum (String). |
 
 > **Hinweis zu `close()`:** Das ist der primäre Durability-Mechanismus für einen sauberen Shutdown. `drop(db)` ist nur ein **Best-Effort-Fallback** (flusht beim Verwerfen, ignoriert Fehler) — es ist keine Durability-Garantie. Rufe `close()` bewusst auf.
 
@@ -227,12 +231,14 @@ my-lsm-db/
 │   ├── schema.rs     → v0.2/v0.3: persistente Collection-/Field-/Index-Registry
 │   ├── ordering.rs   → v0.3: order-preserving Encoding für Index-Werte
 │   ├── index.rs      → v0.3: Secondary Indexes (create/drop/find/rebuild)
-│   └── entity.rs     → v0.2-v0.4: Entity + EntityStore + Transaction (put/get/delete, Reconstruction, Index-Maintenance)
+│   ├── query/        → v0.5: Query-Planner/Executor (ast, expression, logical, physical, planner, executor, explain)
+│   └── entity.rs     → v0.2-v0.5: Entity + EntityStore + Transaction + Query (put/get/delete, Reconstruction, Index-Maintenance)
 └── tests/
     ├── engine.rs     → Integrationstests (Flush, Recovery, Compaction, ...)
     ├── entity.rs     → v0.2: Smoke-Tests (put/get, Persistenz über Reopen)
     ├── index.rs      → v0.3: Oracle-Test (find vs Full-Scan)
-    └── transaction.rs → v0.4: Random-Modell-Oracle (commit/abort/crash/restart/index/entity)
+    ├── transaction.rs → v0.4: Random-Modell-Oracle (commit/abort/crash/restart/index/entity)
+    └── query.rs      → v0.5: Oracle-Test (query vs Full-Scan)
 ```
 
 ---
@@ -282,6 +288,9 @@ cargo test
 - **2 Crash-Tests** (`tests/crash.rs`): Clean-Close-Persistenz + Crash-Recovery ohne Korruption.
 - **1 Index-Oracle-Test** (`tests/index.rs`): 8000 zufällige Mutationen, `find` vs. Full-Scan identisch.
 - **1 Transaktions-Oracle-Test** (`tests/transaction.rs`): Random-Modell-Tester mischt commit/abort/crash/restart/index/entity und prüft get/scan/find gegen ein In-Memory-Modell.
+- **1 Query-Oracle-Test** (`tests/query.rs`): 200 zufällige Prädikate (AND/OR/NOT + 6 Vergleiche + fehlende Felder) werden gegen einen **Full-Scan** geprüft — Ausführung und Oracle teilen sich dieselbe `eval`-Semantik. Zusätzlich `basic_queries_match_oracle`, `missing_field_ne_vs_not_eq_consistent` und `explain_prints_tree`.
+
+> **Gesamt: 64 Tests grün.** Die Ausführungs-Orchestrierung (`tests/index.rs`, `tests/transaction.rs`, `tests/query.rs`) dauert im Debug-Modus mehrere Minuten (Volle Full-Scan-Oracle).
 
 ---
 
@@ -293,6 +302,7 @@ cargo test
 - Compaction führt nur **einen** Merge-Schritt pro Flush aus (kein mehrstufiges Level-System, keine selektive Compaction).
 - Bloom-Filter sind fest auf `1024` Bit gesetzt, nicht an die Datenmenge angepasst.
 - Der `TableCache` hält Reader im RAM; bei sehr vielen Tabellen wächst er entsprechend.
+- **`limit` ohne `sort` ist undefiniert** (v0.5): Nur mit `sort` ist die Reihenfolge der Ergebniszeilen und damit `limit` deterministisch.
 
 ---
 
@@ -463,6 +473,67 @@ tx.commit()?;                            // atomar, durable
 
 ---
 
+## v0.5 — Query-Planner / Query-Optimizer
+
+Eine kleine **deklarative Query-Sprache** über dem Entity-Layer. Die Query wird nicht zeilenweise "einfach so" ausgeführt, sondern vom **Planner** in einen physischen Plan übersetzt — er entscheidet, ob über einen **Secondary Index** gesucht oder **voll gescannt** wird, und was als Rest-Filter übrig bleibt.
+
+```rust
+use my_lsm_db::codec::Value;
+use my_lsm_db::entity::EntityStore;
+use my_lsm_db::query::{SortDir, eq, ge};
+
+let mut store = EntityStore::open("data")?;
+
+let b = store
+    .query("users")?
+    .filter(ge("age", Value::Int(30)))
+    .filter(eq("country", Value::String("DE".into())))
+    .sort("age", SortDir::Asc)
+    .limit(50);
+
+let rows: Vec<(String, Entity)> = store.execute_query(b)?; // (entity_id, entity)
+
+// oder: den physischen Plan als Baum ansehen:
+println!("{}", store.explain_query(&b)?);
+```
+
+`explain_query` zeigt, **wie** der Planner sucht (echte Ausgabe):
+
+```text
+Limit { n: 50 }
+  Sort { field: age, dir: Asc }
+    Filter { predicate: country = "DE" }
+      Fetch { collection: users }
+        IndexScan { collection: users, field: age, range: [30,]..∅ }
+```
+
+Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` wird als **Residual-Filter** auf die Index-Kandidaten angewendet. Die Query-Sprache ist nur die Oberfläche — der eigentliche Wert steckt darunter im Planner.
+
+**Wie der Planner arbeitet (Kurzfassung):**
+
+1. **DNF:** Das Prädikat wird in eine Disjunktive Normalform gebracht (`AND`-Klauseln, die mit `OR` verbunden sind). Negation bleibt als Literal erhalten — sie wird **nie** in inverse Bereichs-Operatoren umgeformt (semantischer Unterschied bei fehlenden Feldern).
+2. **Regelbasierte Indexwahl:** Für jede `AND`-Klausel wird **ein** indexierbares Feld gewählt (`Eq` schlägt Bereichs-Vergleiche, sonst lexikografisch kleinstes Feld, deterministisch). Die Index-Bedingungen werden zu einem `(lower, upper)`-Bound-Paar verdichtet (auch gemischte Exklusivität wie `>30 AND <40`).
+3. **Residual-Filter:** Alle nicht index-abgedeckten Bedingungen (und die eines `OR` immer das **volle** Prädikat) bleiben als `Filter` stehen. Ein Index liefert nur **Kandidaten**; der Filter re-prüft exakt.
+4. **OR → Union:** `OR`-Klauseln werden per `UnionIds` (dedupliziert) zusammengeführt.
+
+**Bewusste Einschränkungen (v0.5-Scope):**
+
+- **Read-only:** `query`/`execute_query`/`explain_query` planen und lesen nur — sie mutieren nie. Transaktions-Queries (`tx.query`), `join`, Aggregationen, Projektion und SQL sind **nicht** Teil von v0.5.
+- **Ein Index pro `AND`-Klausel:** keine index-order-Sortierung, kein Cost-Based Optimizer, keine Kardinalitäts-Schätzung — der Planner ist bewusst einfach und regelbasiert.
+- **`Ne` ist kein Index-Zugriff** (es bleibt ein Residual-Filter); `Ne` wird als `Not(Eq)` ausgewertet — konsistent auch für fehlende Felder.
+- **`limit` ohne `sort` = undefinierte Reihenfolge** (dokumentiert; nur mit `sort` ist `limit` deterministisch).
+
+| Komponente | Test-Ergebnis |
+|---|---|
+| AST (Predicate: And/Or/Not/Field, Cmp, Builder `eq/ne/lt/le/gt/ge`) | ok |
+| Eval (Missing-Field-Semantik, `Ne ≡ Not(Eq)`, `Not` kompositional) | ok |
+| Planner (DNF, Bound-Merging, regelbasierte Indexwahl, OR→Union) | ok |
+| Executor (IndexScan/FullScan/Fetch/Filter/Sort/Limit, deterministisch) | ok |
+| Explain (Baum-Darstellung) | ok |
+| Oracle-Test (`tests/query.rs`, 200 Random-Queries vs Full-Scan) | ok |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -472,6 +543,7 @@ tx.commit()?;                            // atomar, durable
 | **v0.2** -fertig- | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
 | **v0.3** -fertig- | Secondary Indexes: order-preserving Codec, geordneter Value-Index, Index-Maintenance, Index-Rebuild, Oracle-Test |
 | **v0.4** -fertig- | Transactions: atomarer Commit über WAL (BEGIN/COMMIT), Read-your-own-writes, Index-Konsistenz, Random-Modell-Oracle |
-| **v0.5** | Query-Planner / Query-Optimizer |
+| **v0.5** -fertig- | Query-Planner/Optimizer: deklarative Queries, DNF, regelbasierte Indexwahl, Residual-Filter, Explain, Full-Scan-Oracle |
+| **v0.6** | Tx-Queries, Cost-Based Optimizer, Index-Order-Sortierung |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.
