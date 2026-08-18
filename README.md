@@ -328,11 +328,11 @@ E|1|123|2 → [1][1]
 
 | Komponente | Test-Ergebnis |
 |---|---|
-| Codec (encode/decode, alle Typen, Unicode, leer, negativ, groß) | ✅ |
-| Key-Codec (roundtrip, Sonderzeichen, Bereichs-Grenzen, Sortierung) | ✅ |
-| Schema (stabile IDs, save/load roundtrip, Reopen) | ✅ |
-| Entity (put/get/delete, Stale-Field-Removal, Reopen, Unicode) | ✅ |
-| Smoke-Tests (`tests/entity.rs`) | ✅ |
+| Codec (encode/decode, alle Typen, Unicode, leer, negativ, groß) | ok |
+| Key-Codec (roundtrip, Sonderzeichen, Bereichs-Grenzen, Sortierung) | ok |
+| Schema (stabile IDs, save/load roundtrip, Reopen) | ok |
+| Entity (put/get/delete, Stale-Field-Removal, Reopen, Unicode) | ok |
+| Smoke-Tests (`tests/entity.rs`) | ok |
 
 ---
 
@@ -340,9 +340,9 @@ E|1|123|2 → [1][1]
 
 | Version | Inhalt |
 |---|---|
-| **v0.1** ✅ | LSM-Engine: `put`/`get`/`delete`/`scan`, WAL, MemTable, SSTable, Bloom, Compaction, Recovery |
-| **v0.1.1** ✅ | Härtung: Clean-Shutdown, Benchmark, Crash-Test, `get`-Optimierung (Punkt-Lookup + Caches) |
-| **v0.2** ✅ | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
+| **v0.1** -fertig- | LSM-Engine: `put`/`get`/`delete`/`scan`, WAL, MemTable, SSTable, Bloom, Compaction, Recovery |
+| **v0.1.1** -fertig- | Härtung: Clean-Shutdown, Benchmark, Crash-Test, `get`-Optimierung (Punkt-Lookup + Caches) |
+| **v0.2** -fertig- | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
 | **v0.3** | Secondary Indexes |
 | **v0.4** | Transactions (PREPARE/COMMIT über WAL, Index-Konsistenz) |
 | **v0.5** | Query-Planner / Query-Optimizer |
