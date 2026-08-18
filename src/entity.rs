@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::index::{self, FindOp};
 use crate::keycodec;
 use crate::ordering;
+use crate::query::{self, QueryBuilder};
 use crate::schema::{IndexStatus, Schema};
 use crate::{Database, DirectMutator, Mutator};
 
@@ -291,7 +292,7 @@ fn core_delete_entity(
 }
 
 /// Kern-Implementierung von `get_entity`, generalisiert über eine Mutator-Sicht.
-fn core_get_entity(
+pub(crate) fn core_get_entity(
     schema: &Schema,
     m: &mut impl Mutator,
     collection_id: u32,
@@ -324,7 +325,7 @@ fn core_get_entity(
 }
 
 /// Kern-Implementierung von `scan_collection`, generalisiert über eine Mutator-Sicht.
-fn core_scan_collection(
+pub(crate) fn core_scan_collection(
     schema: &Schema,
     m: &mut impl Mutator,
     collection_id: u32,
@@ -509,6 +510,29 @@ impl EntityStore {
             self.create_index(c, f)?;
         }
         Ok(())
+    }
+
+    /// Startet eine Query auf einer Collection (v0.5, read-only). Existiert die
+    /// Collection nicht, liefert die Query ein leeres Ergebnis — es wird
+    /// **kein** Schema-Eintrag angelegt.
+    pub fn query(&mut self, collection: &str) -> Result<QueryBuilder> {
+        Ok(QueryBuilder::new(collection))
+    }
+
+    /// Plant und führt eine Query aus. Ergebnis: `Vec<(Entity-ID, Entity)>`
+    /// (wie `scan_collection`). Die Query ist rein lesend.
+    pub fn execute_query(&mut self, builder: QueryBuilder) -> Result<Vec<(String, Entity)>> {
+        let logical = builder.build();
+        let physical = query::planner::plan(&self.schema, logical);
+        query::executor::run(&mut self.db, &self.schema, &physical)
+    }
+
+    /// Plant eine Query und liefert die Text-Baumdarstellung des Physical Plans
+    /// (Debugging des Optimizers — keine Ausführung).
+    pub fn explain_query(&self, builder: &QueryBuilder) -> Result<String> {
+        let logical = builder.clone().build();
+        let physical = query::planner::plan(&self.schema, logical);
+        Ok(query::explain::format(&physical))
     }
 }
 

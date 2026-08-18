@@ -8,6 +8,7 @@ pub mod keycodec;
 pub mod manifest;
 pub mod memtable;
 pub mod ordering;
+pub mod query;
 pub mod schema;
 pub mod sstable;
 pub mod wal;

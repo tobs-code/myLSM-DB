@@ -84,6 +84,11 @@ impl Schema {
         id
     }
 
+    /// Liefert die ID einer bereits bekannten Collection (ohne sie anzulegen).
+    pub fn lookup_collection_id(&self, name: &str) -> Option<u32> {
+        self.collection_id_of.get(name).copied()
+    }
+
     /// Liefert die ID eines bereits bekannten Feldes (ohne es anzulegen).
     pub fn lookup_field_id(&self, collection_id: u32, name: &str) -> Option<u32> {
         self.field_id_of
