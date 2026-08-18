@@ -22,12 +22,12 @@ pub enum Value {
 }
 
 /// Type-Tags (versioniert über den Tag-Wert).
-const TAG_NULL: u8 = 0;
-const TAG_BOOL: u8 = 1;
-const TAG_INT: u8 = 2;
-const TAG_FLOAT: u8 = 3;
-const TAG_STRING: u8 = 4;
-const TAG_BYTES: u8 = 5;
+pub const TAG_NULL: u8 = 0;
+pub const TAG_BOOL: u8 = 1;
+pub const TAG_INT: u8 = 2;
+pub const TAG_FLOAT: u8 = 3;
+pub const TAG_STRING: u8 = 4;
+pub const TAG_BYTES: u8 = 5;
 
 /// Kodiert einen Wert in sein Binärformat.
 pub fn encode(v: &Value) -> Vec<u8> {

@@ -163,6 +163,9 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `col.put(entity_id, &entity)` | v0.2: ersetzt eine Entität (entfernt veraltete Felder). |
 | `col.get(entity_id)` | v0.2: liefert `Option<Entity>`. |
 | `col.delete(entity_id)` | v0.2: löscht eine Entität. |
+| `col.create_index(field)` | v0.3: legt einen geordneten Index auf einem Feld an (auch mit Bestandsdaten). |
+| `col.drop_index(field)` | v0.3: löscht Index-Definition + -Daten. |
+| `col.find(field, FindOp)` | v0.3: Index-Abfrage, liefert verifizierte `Vec<EntityId>`. |
 
 > **Hinweis zu `close()`:** Das ist der primäre Durability-Mechanismus für einen sauberen Shutdown. `drop(db)` ist nur ein **Best-Effort-Fallback** (flusht beim Verwerfen, ignoriert Fehler) — es ist keine Durability-Garantie. Rufe `close()` bewusst auf.
 
@@ -197,11 +200,14 @@ my-lsm-db/
 │   ├── iterator.rs   → Merge-Iterator über mehrere sortierte Quellen
 │   ├── codec.rs      → v0.2: getypter Value-Codec (Null/Bool/Int/Float/String/Bytes)
 │   ├── keycodec.rs   → v0.2: binäres Entity-Key-Encoding + Bereichs-Grenzen
-│   ├── schema.rs     → v0.2: persistente Collection-/Field-Registry
-│   └── entity.rs     → v0.2: Entity + EntityStore (put/get/delete, Reconstruction)
+│   ├── schema.rs     → v0.2/v0.3: persistente Collection-/Field-/Index-Registry
+│   ├── ordering.rs   → v0.3: order-preserving Encoding für Index-Werte
+│   ├── index.rs      → v0.3: Secondary Indexes (create/drop/find/rebuild)
+│   └── entity.rs     → v0.2/v0.3: Entity + EntityStore (put/get/delete, Reconstruction, Index-Maintenance)
 └── tests/
     ├── engine.rs     → Integrationstests (Flush, Recovery, Compaction, ...)
-    └── entity.rs     → v0.2: Smoke-Tests (put/get, Persistenz über Reopen)
+    ├── entity.rs     → v0.2: Smoke-Tests (put/get, Persistenz über Reopen)
+    └── index.rs      → v0.3: Oracle-Test (find vs Full-Scan)
 ```
 
 ---
@@ -336,6 +342,57 @@ E|1|123|2 → [1][1]
 
 ---
 
+## v0.3 — Secondary Indexes
+
+Getypte Secondary Indexes über der KV-Engine. Ein **einzelner, geordneter `Value`-Index** (order-preserving) deckt `=`, `<`, `<=`, `>`, `>=`, `between` ab — keine separaten Index-Implementierungen pro Operator.
+
+```rust
+use my_lsm_db::codec::Value;
+use my_lsm_db::index::FindOp;
+
+store.collection("users")?.create_index("age")?;
+
+let eq = store.collection("users")?.find("age", FindOp::Eq(Value::Int(31)))?; // Vec<EntityId>
+let range = store.collection("users")?
+    .find("age", FindOp::Between(Value::Int(18), Value::Int(65)))?;
+```
+
+**Index-Key-Format:**
+
+```text
+I | collection_id | field_id | encoded_value | entity_id
+```
+
+Der `encoded_value` ist **ordnungserhaltend** (`a < b` ⇔ `encode(a) < encode(b)`) und selbst-delimitierend:
+
+| Typ | Encoding |
+|---|---|
+| `Int64` | `(v as u64) ^ i64::MIN`, Big-Endian |
+| `Float64` | monotone Bits; totale Ordnung `-∞ < … < -0 == +0 < … < +∞ < NaN` |
+| `Bool` | 1 Byte |
+| `String`/`Bytes` | null-freies Escaping (`0x00`→`0x00 0x01`) + Terminator `0x00 0x00` |
+
+**Architektur-Invarianten (in `index.rs` dokumentiert):**
+
+1. **Die Entity ist immer Source of Truth.** Ein Index liefert nur Kandidaten, nie den Entity-Zustand.
+2. **Ein Index darf False Positives enthalten, aber NIEMALS False Negatives.** `find()` verifiziert deshalb jede Kandidaten-Entity gegen ihren echten Wert.
+3. **Write-Reihenfolge:** `PUT neuer Index-Eintrag → PUT Entity → DELETE alter Index-Eintrag`. Dadurch ist der Index während einer Änderung temporär ein **Superset** (nie ein Subset) der korrekten Einträge — die False-Negative-Invariante gilt **ohne** Transactions.
+
+**Index-Verwaltung:** `create_index` persistiert die Definition als `BUILDING` (fsync), baut den Index aus den vorhandenen Entities auf, dann `READY` (fsync). Ein Crash während des Builds hinterlässt `BUILDING` → beim nächsten `open` wird der Index **vollständig neu** gebaut (idempotent).
+
+**Proof:** Der Oracle-Test (`tests/index.rs`) vergleicht nach **8000 zufälligen Mutationen** (Updates, Deletes, Re-Inserts) plus Flush, Compaction und Restart jede `find()`-Abfrage gegen einen **Full-Scan** der Entity-Daten — beide sind identisch.
+
+| Komponente | Test-Ergebnis |
+|---|---|
+| `ordering` (order-preserving Codec: Int/Float/String/Bytes/Bool/Null) | ok |
+| `ordering` Property-Tests (Byte-Ordnung == Wert-Ordnung, Sortier-Stabilität) | ok |
+| Schema (Index-Definitionen, BUILDING/READY, save/load) | ok |
+| Index-Key-Codec (roundtrip, Sonderzeichen, Bereichs-Grenzen) | ok |
+| `find` (Eq/Gt/Gte/Lt/Lte/Between) + Maintenance (Update/Delete) | ok |
+| Oracle-Test (`tests/index.rs`, 8000 Mutationen vs Full-Scan) | ok |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -343,7 +400,7 @@ E|1|123|2 → [1][1]
 | **v0.1** -fertig- | LSM-Engine: `put`/`get`/`delete`/`scan`, WAL, MemTable, SSTable, Bloom, Compaction, Recovery |
 | **v0.1.1** -fertig- | Härtung: Clean-Shutdown, Benchmark, Crash-Test, `get`-Optimierung (Punkt-Lookup + Caches) |
 | **v0.2** -fertig- | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
-| **v0.3** | Secondary Indexes |
+| **v0.3** -fertig- | Secondary Indexes: order-preserving Codec, geordneter Value-Index, Index-Maintenance, Index-Rebuild, Oracle-Test |
 | **v0.4** | Transactions (PREPARE/COMMIT über WAL, Index-Konsistenz) |
 | **v0.5** | Query-Planner / Query-Optimizer |
 

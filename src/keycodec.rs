@@ -10,6 +10,69 @@
 /// Namespace-Tag für Entity-Keys.
 pub const ENTITY_TAG: u8 = b'E'; // 0x45
 
+/// Namespace-Tag für Index-Keys.
+pub const INDEX_TAG: u8 = b'I'; // 0x49
+
+/// Layout eines Index-Keys:
+/// ```text
+/// [0x49 'I'] [collection_id u32] [field_id u32] [encoded_value] [entity_id_len u32] [entity_id]
+/// ```
+/// `encoded_value` ist ordnungserhaltend und selbst-delimitierend (siehe
+/// [`crate::ordering`]), sodass die entity_id direkt folgen kann.
+pub fn encode_index_key(collection_id: u32, field_id: u32, encoded_value: &[u8], entity_id: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + 4 + encoded_value.len() + 4 + entity_id.len());
+    out.push(INDEX_TAG);
+    out.extend_from_slice(&collection_id.to_le_bytes());
+    out.extend_from_slice(&field_id.to_le_bytes());
+    out.extend_from_slice(encoded_value);
+    out.extend_from_slice(&(entity_id.len() as u32).to_le_bytes());
+    out.extend_from_slice(entity_id);
+    out
+}
+
+/// Dekodiert einen Index-Key in (collection_id, field_id, entity_id).
+/// `None`, wenn der Key kein gültiger Index-Key ist.
+pub fn decode_index_key(key: &[u8]) -> Option<(u32, u32, &[u8])> {
+    if key.len() < 1 + 4 + 4 + 4 || key[0] != INDEX_TAG {
+        return None;
+    }
+    let mut off = 1;
+    let collection_id = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
+    off += 4;
+    let field_id = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
+    off += 4;
+    // Der ordnungserhaltende Wert ist selbst-delimitierend → Länge parsen.
+    let value_len = crate::ordering::ordered_value_len(&key[off..]).ok()?;
+    off += value_len;
+    if off + 4 > key.len() {
+        return None;
+    }
+    let entity_len = u32::from_le_bytes(key[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    if off + entity_len > key.len() {
+        return None;
+    }
+    let entity_id = &key[off..off + entity_len];
+    Some((collection_id, field_id, entity_id))
+}
+
+/// Präfix aller Index-Keys eines (collection, field).
+pub fn index_field_prefix(collection_id: u32, field_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + 4);
+    out.push(INDEX_TAG);
+    out.extend_from_slice(&collection_id.to_le_bytes());
+    out.extend_from_slice(&field_id.to_le_bytes());
+    out
+}
+
+/// Präfix aller Index-Keys eines (collection, field) mit einem bestimmten
+/// ordnungserhaltend kodierten Wert.
+pub fn index_value_prefix(collection_id: u32, field_id: u32, encoded_value: &[u8]) -> Vec<u8> {
+    let mut out = index_field_prefix(collection_id, field_id);
+    out.extend_from_slice(encoded_value);
+    out
+}
+
 /// Kodiert einen Entity-Feld-Schlüssel.
 pub fn encode_entity_key(collection_id: u32, entity_id: &[u8], field_id: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + 4 + entity_id.len() + 4);
@@ -41,6 +104,14 @@ pub fn decode_entity_key(key: &[u8]) -> Option<(u32, &[u8], u32)> {
     Some((collection_id, entity_id, field_id))
 }
 
+/// Präfix aller Entity-Keys einer Collection.
+pub fn collection_prefix(collection_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4);
+    out.push(ENTITY_TAG);
+    out.extend_from_slice(&collection_id.to_le_bytes());
+    out
+}
+
 /// Liefert das gemeinsame Präfix aller Feld-Keys einer Entity.
 pub fn entity_prefix(collection_id: u32, entity_id: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + 4 + entity_id.len());
@@ -62,7 +133,7 @@ pub fn entity_range(collection_id: u32, entity_id: &[u8]) -> (Vec<u8>, Option<Ve
 /// Liefert den lexikografischen Nachfolger eines Präfixes: die kleinste
 /// Bytefolge, die größer als alle mit `prefix` beginnenden Keys ist.
 /// `None`, wenn alle Bytes 0xFF sind (dann gibt es keinen Nachfolger).
-fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut p = prefix.to_vec();
     let mut i = p.len();
     while i > 0 {

@@ -12,6 +12,40 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+/// Status eines Index-Aufbaus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStatus {
+    /// Index wird gerade aufgebaut; nach einem Crash wird er neu gebaut.
+    Building,
+    /// Index ist vollständig und nutzbar.
+    Ready,
+}
+
+impl IndexStatus {
+    fn code(&self) -> &'static str {
+        match self {
+            IndexStatus::Building => "BUILDING",
+            IndexStatus::Ready => "READY",
+        }
+    }
+    fn from_code(s: &str) -> Result<IndexStatus> {
+        match s {
+            "BUILDING" => Ok(IndexStatus::Building),
+            "READY" => Ok(IndexStatus::Ready),
+            _ => Err(Error::InvalidFormat("unknown index status".into())),
+        }
+    }
+}
+
+/// Definition eines Secondary Index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexDef {
+    pub id: u32,
+    pub collection_id: u32,
+    pub field_id: u32,
+    pub status: IndexStatus,
+}
+
 /// Persistente Zuordnung von Collection-/Field-Namen zu stabilen IDs.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
@@ -27,6 +61,8 @@ pub struct Schema {
     field_id_of: HashMap<(u32, String), u32>,
     /// `true`, wenn neue IDs vergeben wurden und noch nicht persistiert sind.
     changed: bool,
+    next_index_id: u32,
+    indexes: Vec<IndexDef>,
 }
 
 impl Schema {
@@ -46,6 +82,11 @@ impl Schema {
         self.collection_name.insert(id, name.to_string());
         self.collection_id_of.insert(name.to_string(), id);
         id
+    }
+
+    /// Liefert die ID eines bereits bekannten Feldes (ohne es anzulegen).
+    pub fn lookup_field_id(&self, collection_id: u32, name: &str) -> Option<u32> {
+        self.field_id_of.get(&(collection_id, name.to_string())).copied()
     }
 
     /// Liefert die ID eines Feldes einer Collection. Existiert es noch nicht,
@@ -77,6 +118,58 @@ impl Schema {
         self.changed
     }
 
+    /// Registriert einen neuen Index (Status BUILDING) für (collection, field).
+    pub fn create_index(&mut self, collection_id: u32, field_id: u32) -> u32 {
+        if let Some(i) = self.indexes.iter().find(|i| i.collection_id == collection_id && i.field_id == field_id) {
+            return i.id;
+        }
+        let id = self.next_index_id;
+        self.next_index_id += 1;
+        self.changed = true;
+        self.indexes.push(IndexDef { id, collection_id, field_id, status: IndexStatus::Building });
+        id
+    }
+
+    /// Setzt einen Index auf READY.
+    pub fn set_index_ready(&mut self, index_id: u32) {
+        if let Some(i) = self.indexes.iter_mut().find(|i| i.id == index_id) {
+            if i.status != IndexStatus::Ready {
+                i.status = IndexStatus::Ready;
+                self.changed = true;
+            }
+        }
+    }
+
+    /// Entfernt einen Index.
+    pub fn drop_index(&mut self, index_id: u32) {
+        let before = self.indexes.len();
+        self.indexes.retain(|i| i.id != index_id);
+        if self.indexes.len() != before {
+            self.changed = true;
+        }
+    }
+
+    /// Liefert den Index zu (collection, field), falls vorhanden.
+    pub fn find_index(&self, collection_id: u32, field_id: u32) -> Option<&IndexDef> {
+        self.indexes
+            .iter()
+            .find(|i| i.collection_id == collection_id && i.field_id == field_id)
+    }
+
+    pub fn index_by_id(&self, id: u32) -> Option<&IndexDef> {
+        self.indexes.iter().find(|i| i.id == id)
+    }
+
+    /// Alle Index-Definitionen (für Rebuild/Recovery).
+    pub fn indexes(&self) -> &[IndexDef] {
+        &self.indexes
+    }
+
+    /// Indizes, die (noch) gebaut werden müssen.
+    pub fn building_indexes(&self) -> impl Iterator<Item = &IndexDef> {
+        self.indexes.iter().filter(|i| i.status == IndexStatus::Building)
+    }
+
     /// Persistiert das Schema atomar.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         let mut buf = String::new();
@@ -91,6 +184,18 @@ impl Schema {
         fields.sort_by_key(|((c, f), _)| (*c, *f));
         for ((c, f), name) in fields {
             buf.push_str(&format!("F {} {} {}\n", c, f, escape(name)));
+        }
+        buf.push_str(&format!("NI {}\n", self.next_index_id));
+        let mut indexes = self.indexes.clone();
+        indexes.sort_by_key(|i| i.id);
+        for i in &indexes {
+            buf.push_str(&format!(
+                "IX {} {} {} {}\n",
+                i.id,
+                i.collection_id,
+                i.field_id,
+                i.status.code()
+            ));
         }
         let tmp = path.with_extension("schema.tmp");
         {
@@ -156,6 +261,34 @@ impl Schema {
                     let name = unescape(name);
                     s.field_name.insert((c, f), name.clone());
                     s.field_id_of.insert((c, name), f);
+                }
+                Some("NI") => {
+                    s.next_index_id = parts
+                        .next()
+                        .ok_or_else(|| Error::InvalidFormat("schema NI".into()))?
+                        .parse()
+                        .map_err(|_| Error::InvalidFormat("schema NI id".into()))?;
+                }
+                Some("IX") => {
+                    let id: u32 = parts
+                        .next()
+                        .ok_or_else(|| Error::InvalidFormat("schema IX id".into()))?
+                        .parse()
+                        .map_err(|_| Error::InvalidFormat("schema IX id".into()))?;
+                    let c: u32 = parts
+                        .next()
+                        .ok_or_else(|| Error::InvalidFormat("schema IX col".into()))?
+                        .parse()
+                        .map_err(|_| Error::InvalidFormat("schema IX col".into()))?;
+                    let f: u32 = parts
+                        .next()
+                        .ok_or_else(|| Error::InvalidFormat("schema IX field".into()))?
+                        .parse()
+                        .map_err(|_| Error::InvalidFormat("schema IX field".into()))?;
+                    let status = IndexStatus::from_code(
+                        parts.next().ok_or_else(|| Error::InvalidFormat("schema IX status".into()))?,
+                    )?;
+                    s.indexes.push(IndexDef { id, collection_id: c, field_id: f, status });
                 }
                 _ => {}
             }
@@ -223,5 +356,31 @@ mod tests {
         let path = dir.path().join("nope");
         let mut s = Schema::load(&path).unwrap();
         assert_eq!(s.collection_id("users"), 0); // startet bei 0
+    }
+
+    #[test]
+    fn index_save_load_roundtrip_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SCHEMA");
+        let mut s = Schema::new();
+        let users = s.collection_id("users");
+        let age = s.field_id(users, "age");
+        let name = s.field_id(users, "name");
+        let age_idx = s.create_index(users, age);
+        s.set_index_ready(age_idx);
+        let name_idx = s.create_index(users, name); // bleibt BUILDING
+        s.save(&path).unwrap();
+
+        let mut loaded = Schema::load(&path).unwrap();
+        assert_eq!(loaded.index_by_id(age_idx).unwrap().status, IndexStatus::Ready);
+        assert_eq!(loaded.index_by_id(name_idx).unwrap().status, IndexStatus::Building);
+        assert_eq!(loaded.find_index(users, age).unwrap().id, age_idx);
+        assert!(loaded.find_index(users, name).is_some());
+        // Stabilität über Reload.
+        assert_eq!(loaded.find_index(users, age).unwrap().id, age_idx);
+
+        // drop
+        loaded.drop_index(age_idx);
+        assert!(loaded.index_by_id(age_idx).is_none());
     }
 }
