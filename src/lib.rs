@@ -1,8 +1,12 @@
+pub mod codec;
 pub mod compaction;
+pub mod entity;
 pub mod error;
 pub mod iterator;
+pub mod keycodec;
 pub mod manifest;
 pub mod memtable;
+pub mod schema;
 pub mod sstable;
 pub mod wal;
 

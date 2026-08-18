@@ -158,6 +158,11 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `db.table_count()` | Anzahl bekannter SSTables. |
 | `db.level_tables(level)` | Anzahl Tabellen in einem Level. |
 | `db.level_count()` | Anzahl Level. |
+| `EntityStore::open(dir)` | v0.2: öffnet Entity-Store (legt darunter eine KV-Engine an). |
+| `store.collection(name)?` | v0.2: Handle auf eine Collection (stabile ID). |
+| `col.put(entity_id, &entity)` | v0.2: ersetzt eine Entität (entfernt veraltete Felder). |
+| `col.get(entity_id)` | v0.2: liefert `Option<Entity>`. |
+| `col.delete(entity_id)` | v0.2: löscht eine Entität. |
 
 > **Hinweis zu `close()`:** Das ist der primäre Durability-Mechanismus für einen sauberen Shutdown. `drop(db)` ist nur ein **Best-Effort-Fallback** (flusht beim Verwerfen, ignoriert Fehler) — es ist keine Durability-Garantie. Rufe `close()` bewusst auf.
 
@@ -189,9 +194,14 @@ my-lsm-db/
 │   ├── sstable.rs    → TableBuilder/TableReader + BloomFilter + sparse Index
 │   ├── manifest.rs   → persistentes SSTable-Set je Level, atomares Speichern
 │   ├── compaction.rs → neue SSTable aus sortiertem Stream schreiben
-│   └── iterator.rs   → Merge-Iterator über mehrere sortierte Quellen
+│   ├── iterator.rs   → Merge-Iterator über mehrere sortierte Quellen
+│   ├── codec.rs      → v0.2: getypter Value-Codec (Null/Bool/Int/Float/String/Bytes)
+│   ├── keycodec.rs   → v0.2: binäres Entity-Key-Encoding + Bereichs-Grenzen
+│   ├── schema.rs     → v0.2: persistente Collection-/Field-Registry
+│   └── entity.rs     → v0.2: Entity + EntityStore (put/get/delete, Reconstruction)
 └── tests/
-    └── engine.rs     → Integrationstests (Flush, Recovery, Compaction, ...)
+    ├── engine.rs     → Integrationstests (Flush, Recovery, Compaction, ...)
+    └── entity.rs     → v0.2: Smoke-Tests (put/get, Persistenz über Reopen)
 ```
 
 ---
@@ -276,13 +286,63 @@ Ergänzt nach der initialen v0.1:
 
 ---
 
+## v0.2 — Entity-Layer
+
+Der **Entity-Layer** baut getypte Entitäten auf der unveränderten v0.1-KV-Maschine auf. Die KV-Engine bleibt "dumm" — sie kennt diese Schicht nicht; die Abhängigkeit geht nur in eine Richtung.
+
+**Scope-Grenze (hart gehalten):** Entity-Layer + Typed Codec + Key-Encoding. **Keine** Sekundärindizes, Query-Sprache, Transactions, MVCC, Netzwerk, Replication.
+
+```rust
+use my_lsm_db::codec::Value;
+use my_lsm_db::entity::{Entity, EntityStore};
+
+let mut store = EntityStore::open("data")?;
+
+let mut user = Entity::new();
+user.insert("name", Value::String("Tobias".into()));
+user.insert("age", Value::Int(31));
+user.insert("active", Value::Bool(true));
+
+store.collection("users")?.put("123", &user)?;
+
+let got = store.collection("users")?.get("123")?.expect("exists");
+assert_eq!(got["age"], Value::Int(31));
+```
+
+**Vier neue Bausteine:**
+
+1. **Typed Value Codec** (`codec.rs`) — eindeutiges, versionierbares Binärformat `[type tag][payload]`. Typen: `Null`, `Bool`, `Int64`, `Float64`, `String`, `Bytes`. Später erweiterbar (`Timestamp`, `UUID`, `Array`, `Object`).
+2. **Key Codec** (`keycodec.rs`) — kein String-Kleben, sondern length-/type-sicheres Binär-Encoding `[E][collection_id u32][entity_id_len][entity_id][field_id u32]`. Keys bleiben eindeutig auch bei Sonderzeichen in IDs. Liefert außerdem die Bereichs-Grenzen für Entity-Scans.
+3. **Persistente Schema-Registry** (`schema.rs`) — weist `collection_id`/`field_id` **stabil und dauerhaft** zu (nicht `Hash(name)`, nicht neu pro Start), sonst würde die Bedeutung eines Keys zwischen Starts wechseln. Atomar gespeichert (`SCHEMA`), nur geschrieben wenn sie sich ändert.
+4. **Entity-Reconstruction** (`entity.rs`) — `EntityStore` zerlegt ein `Entity` in Feld-Keys und rekonstruiert es beim Lesen. `put` ersetzt die Entität exakt (entfernt auch veraltete Felder); `get` liefert `None`, wenn keine lebenden Felder mehr existieren.
+
+Intern landet alles weiterhin nur als KV-Zeilen:
+
+```text
+E|1|123|0 → [4]["Tobias"]
+E|1|123|1 → [2][31]
+E|1|123|2 → [1][1]
+```
+
+**Durability-Reihenfolge:** Die Schema-Registry wird (fsync) **vor** den Entitätsdaten persistiert, damit eine Feld-ID nach einem Crash nie eine andere Bedeutung hat.
+
+| Komponente | Test-Ergebnis |
+|---|---|
+| Codec (encode/decode, alle Typen, Unicode, leer, negativ, groß) | ✅ |
+| Key-Codec (roundtrip, Sonderzeichen, Bereichs-Grenzen, Sortierung) | ✅ |
+| Schema (stabile IDs, save/load roundtrip, Reopen) | ✅ |
+| Entity (put/get/delete, Stale-Field-Removal, Reopen, Unicode) | ✅ |
+| Smoke-Tests (`tests/entity.rs`) | ✅ |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
 |---|---|
 | **v0.1** ✅ | LSM-Engine: `put`/`get`/`delete`/`scan`, WAL, MemTable, SSTable, Bloom, Compaction, Recovery |
 | **v0.1.1** ✅ | Härtung: Clean-Shutdown, Benchmark, Crash-Test, `get`-Optimierung (Punkt-Lookup + Caches) |
-| **v0.2** | Entity-Layer (Wide-Column-Encoding `collection\|entity\|field\|version`) |
+| **v0.2** ✅ | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
 | **v0.3** | Secondary Indexes |
 | **v0.4** | Transactions (PREPARE/COMMIT über WAL, Index-Konsistenz) |
 | **v0.5** | Query-Planner / Query-Optimizer |
