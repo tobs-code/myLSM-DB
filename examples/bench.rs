@@ -2,7 +2,7 @@
 //!
 //! Aufruf: `cargo run --example bench [n]`
 //! misst put / random get / sequential get / scan und berichtet Metriken.
-use lsm_db::{Database, Options};
+use my_lsm_db::{Database, Options};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -41,7 +41,7 @@ fn main() {
     let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key-{:08}", i).into_bytes()).collect();
     let vals: Vec<Vec<u8>> = (0..n).map(|i| format!("value-{}", i).into_bytes()).collect();
 
-    println!("== lsm-db benchmark: {} keys ==", n);
+    println!("== myLSM-DB benchmark: {} keys ==", n);
 
     // --- put ---
     let t = Instant::now();

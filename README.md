@@ -166,7 +166,7 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 ## Konfiguration
 
 ```rust
-use lsm_db::{Database, Options};
+use my_lsm_db::{Database, Options};
 
 let opts = Options {
     memtable_limit: 4 * 1024 * 1024, // Byte, ab wann geflusht wird
@@ -179,7 +179,7 @@ let opts = Options {
 ## Projektstruktur
 
 ```
-lsm-db/
+my-lsm-db/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs        → Database, Options, öffentliche API, Flush/Compaction
@@ -202,11 +202,11 @@ Als Dependency in `Cargo.toml`:
 
 ```toml
 [dependencies]
-lsm-db = { path = "../lsm-db" }
+my-lsm-db = { path = "../my-lsm-db" }
 ```
 
 ```rust
-use lsm_db::Database;
+use my_lsm_db::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db = Database::open("./data")?;

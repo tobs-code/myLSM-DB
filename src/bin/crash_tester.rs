@@ -7,7 +7,7 @@
 //!
 //! Der Loop über viele Runs (mit zufälligen Kill-Punkten) passiert im Test
 //! `tests/crash.rs` via `std::process::Command`.
-use lsm_db::{Database, Options};
+use my_lsm_db::{Database, Options};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 

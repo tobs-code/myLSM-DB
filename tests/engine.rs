@@ -1,4 +1,4 @@
-use lsm_db::{Database, Options};
+use my_lsm_db::{Database, Options};
 
 #[test]
 fn put_get_delete_basic() {

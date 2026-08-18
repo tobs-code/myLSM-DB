@@ -21,7 +21,7 @@ fn crash_recovery_no_corruption() {
         let _ = std::fs::remove_dir_all(&dir);
 
         // Seed: schreibt N Keys und killt sich an einem zufälligen Punkt.
-        let status = Command::new(crash_tester())
+        let _ = Command::new(crash_tester())
             .args(["seed", dir.to_str().unwrap(), &N.to_string()])
             .status()
             .expect("run seed");
