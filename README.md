@@ -1,4 +1,4 @@
-# lsm-db
+# myLSM-DB
 
 > ⚠️ **Work in Progress** — Dieses Projekt ist **noch nicht fertig** und befindet sich in aktiver Entwicklung. Die API und das Verhalten können sich jederzeit ändern. Nicht für Produktion geeignet.
 
