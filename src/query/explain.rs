@@ -28,6 +28,22 @@ fn write_node(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 format_range(lower, upper)
             ));
         }
+        PhysicalPlan::IndexOrderScan {
+            collection,
+            field,
+            lower,
+            upper,
+            dir,
+        } => {
+            let dir = match dir {
+                SortDir::Asc => "Asc",
+                SortDir::Desc => "Desc",
+            };
+            out.push_str(&format!(
+                "IndexOrderScan {{ collection: {collection}, field: {field}, range: {}, dir: {dir} }}",
+                format_range(lower, upper)
+            ));
+        }
         PhysicalPlan::FullScan { collection } => {
             out.push_str(&format!("FullScan {{ collection: {collection} }}"));
         }

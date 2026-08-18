@@ -192,12 +192,14 @@ fn explain_prints_tree() {
         })
         .unwrap();
 
+    // Fallback-Fall: `name` ist nicht indexiert → Sort bleibt (kein
+    // IndexOrderScan, da die Enablement-Regel einen READY-Index verlangt).
     let b = store
         .query("users")
         .unwrap()
         .filter(ge("age", int(30)))
         .filter(eq("city", Value::String("DE".into())))
-        .sort("age", SortDir::Asc)
+        .sort("name", SortDir::Asc)
         .limit(10);
     let s = store.explain_query(&b).unwrap();
     assert!(s.contains("IndexScan"), "expected index scan, got:\n{s}");

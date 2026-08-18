@@ -5,9 +5,10 @@
 //! 1. Das Prädikat wird in **DNF** zerlegt (`OR` top-level, jede Klausel eine
 //!    Konjunktion von Literalen).
 //! 2. Pro AND-Klausel wird **ein** Index gewählt: ein Feld mit READY-Index, das
-//!    ein indexierbares (nicht-negiertes, `!=`-freies) Prädikat trägt. Heuristik:
-//!    `Eq`-Prädikat bevorzugt, sonst lexikographisch kleinstes Feldname
-//!    (deterministisch). **Kein** Cost-Based, keine Cardinality.
+//!    ein indexierbares (nicht-negiertes, `!=`-freies) Prädikat trägt. Cost-basiert:
+//!    `cost = BASE_CARDINALITY * selectivity(shape)` mit `Eq < Between < OneSided`;
+//!    bei gleichem Shape gewinnt das enger gebundene Literal, sonst lex kleinstes
+//!    Feldname (deterministisch). Keine Statistik-/Cardinality-Infrastruktur.
 //! 3. Die Bounds des gewählten Feldes werden zum Index-Range gemerged; das Feld
 //!    fällt damit aus dem Residual-Filter heraus (`IndexScan` liefert bereits
 //!    verifizierte IDs).
@@ -121,9 +122,70 @@ fn dnf_not(pred: &Predicate) -> Vec<Vec<Lit>> {
     }
 }
 
-/// Wählt aus den indexierbaren Feldern einer Klausel den zu verwendenden Index
-/// (regelbasiert, deterministisch): `Eq` bevorzugt, sonst kleinstes Feldname.
-fn pick_index_field<'a>(lits: &'a [Lit], schema: &Schema, collection_id: u32) -> Option<&'a str> {
+/// Konstanter Cardinality-Platzhalter des Kostenmodells (v0.6). Explizit ein
+/// Heuristik-Wert, später durch echte Statistiken ersetzbar — aber **keine**
+/// Statistik-Infrastruktur in v0.6.
+const BASE_CARDINALITY: f64 = 1.0;
+
+/// Selektivitäts-Shape eines indexierbaren Literals: `Eq < Between < OneSided`.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    Eq,
+    Between,
+    OneSided,
+}
+
+impl Shape {
+    /// Shape-Selektivität (kleiner = selektiver = günstiger).
+    fn selectivity(self) -> f64 {
+        match self {
+            Shape::Eq => 0.1,
+            Shape::Between => 0.25,
+            Shape::OneSided => 0.5,
+        }
+    }
+}
+
+/// Bestimmt den Selektivitäts-Shape eines Feldes. Ein `Eq`-Literal dominiert
+/// (Selektivität 0.1); sonst gilt ein Feld mit beiden Bounds als `Between`,
+/// mit nur einem Bound als einseitige Range.
+fn field_shape(lits: &[Lit], field: &str, lower: &Bound, upper: &Bound) -> Shape {
+    use Bound::*;
+    let has_eq = lits
+        .iter()
+        .any(|l| l.indexable() && l.field == field && l.cmp == Cmp::Eq);
+    if has_eq {
+        return Shape::Eq;
+    }
+    match (lower, upper) {
+        (Unbounded, _) | (_, Unbounded) => Shape::OneSided,
+        _ => Shape::Between,
+    }
+}
+
+/// Ist `(la, ua)` ein strikt engerer gebundener Bereich als `(lb, ub)`?
+/// Erst das untere Bound (höher = enger), dann das obere Bound (niedriger = enger).
+fn tighter(la: &Bound, ua: &Bound, lb: &Bound, ub: &Bound) -> bool {
+    if lower_stronger(la, lb) {
+        return true;
+    }
+    if lower_stronger(lb, la) {
+        return false;
+    }
+    upper_stronger(ua, ub)
+}
+
+/// Wählt aus den indexierbaren Feldern einer Klausel den günstigsten Index
+/// (cost-basiert, deterministisch).
+///
+/// Kostenmodell: `cost = BASE_CARDINALITY * selectivity(shape)` mit
+/// `Eq < Between < OneSided`. Bei gleicher Selektivität gewinnt das enger
+/// gebundene Literal; letzter Tie-Break ist das lex kleinstes Feldname.
+fn pick_index_field_cost<'a>(
+    lits: &'a [Lit],
+    schema: &Schema,
+    collection_id: u32,
+) -> Option<&'a str> {
     let has_index = |l: &'a Lit| -> bool {
         if !l.indexable() {
             return false;
@@ -134,17 +196,54 @@ fn pick_index_field<'a>(lits: &'a [Lit], schema: &Schema, collection_id: u32) ->
             .map(|idx| idx.status == IndexStatus::Ready)
             .unwrap_or(false)
     };
-    let mut eq_candidates: Vec<&Lit> = lits
+
+    let mut fields: Vec<&str> = lits
         .iter()
-        .filter(|l| l.indexable() && l.cmp == Cmp::Eq && has_index(l))
+        .filter(|l| has_index(l))
+        .map(|l| l.field.as_str())
         .collect();
-    eq_candidates.sort_by_key(|l| l.field.clone());
-    if let Some(l) = eq_candidates.first() {
-        return Some(&l.field);
+    fields.sort_unstable();
+    fields.dedup();
+
+    let mut best: Option<(&str, Shape, Bound, Bound)> = None;
+    for field in fields {
+        let (lower, upper) = merge_bounds(lits, field);
+        let shape = field_shape(lits, field, &lower, &upper);
+        let cand = (field, shape, lower, upper);
+        best = Some(match best {
+            None => cand,
+            Some(b) => {
+                if cheaper(&cand, &b) {
+                    cand
+                } else {
+                    b
+                }
+            }
+        });
     }
-    let mut range_candidates: Vec<&Lit> = lits.iter().filter(|l| has_index(l)).collect();
-    range_candidates.sort_by_key(|l| l.field.clone());
-    range_candidates.first().map(|l| l.field.as_str())
+    best.map(|(field, _, _, _)| field)
+}
+
+/// Kosten-Vergleich zweier Kandidaten (deterministische Total-Ordnung).
+///
+/// Zuerst zählt die Shape-Selektivität (kleiner = besser); bei gleicher
+/// Selektivität die engere Bounds; zuletzt das lex kleinstes Feldname.
+fn cheaper(a: &(&str, Shape, Bound, Bound), b: &(&str, Shape, Bound, Bound)) -> bool {
+    let cost_a = BASE_CARDINALITY * a.1.selectivity();
+    let cost_b = BASE_CARDINALITY * b.1.selectivity();
+    if cost_a < cost_b {
+        return true;
+    }
+    if cost_a > cost_b {
+        return false;
+    }
+    if tighter(&a.2, &a.3, &b.2, &b.3) {
+        return true;
+    }
+    if tighter(&b.2, &b.3, &a.2, &a.3) {
+        return false;
+    }
+    a.0 < b.0
 }
 
 /// Vergleich zweier Bound-Werte für das "engere" untere Bound (größer ist enger).
@@ -253,7 +352,7 @@ fn plan_clause(
     collection_id: u32,
     clause: &[Lit],
 ) -> (PhysicalPlan, Vec<Lit>) {
-    if let Some(field) = pick_index_field(clause, schema, collection_id) {
+    if let Some(field) = pick_index_field_cost(clause, schema, collection_id) {
         let (lower, upper) = merge_bounds(clause, field);
         let index = PhysicalPlan::IndexScan {
             collection: collection.to_string(),
@@ -277,6 +376,65 @@ fn plan_clause(
         };
         (scan, clause.to_vec())
     }
+}
+
+/// Merge für den OR-Fall: vereinigt die Bounds eines Feldes über alle Klauseln
+/// (Union = der **weiteste** Bereich, der jede Klausel-Range überdeckt).
+fn union_bounds(clauses: &[Vec<Lit>], field: &str) -> (Bound, Bound) {
+    use Bound::*;
+    let mut lower: Option<Bound> = None;
+    let mut upper: Option<Bound> = None;
+    for clause in clauses {
+        let (l, u) = merge_bounds(clause, field);
+        lower = Some(match lower {
+            None => l,
+            Some(cur) => {
+                if lower_stronger(&l, &cur) {
+                    cur
+                } else {
+                    l
+                }
+            }
+        });
+        upper = Some(match upper {
+            None => u,
+            Some(cur) => {
+                if upper_stronger(&u, &cur) {
+                    cur
+                } else {
+                    u
+                }
+            }
+        });
+    }
+    (lower.unwrap_or(Unbounded), upper.unwrap_or(Unbounded))
+}
+
+/// Enablement-Regel für `IndexOrderScan` (v0.6, Teil 3): Das Sortierfeld muss
+/// in **jeder** DNF-Klausel ein positives, indexierbares Literal tragen und
+/// einen READY-Index haben. Nur dann enthalten alle möglicherweise treffenden
+/// Zeilen das Feld, und der geordnete Index-Scan ist exakt äquivalent zum
+/// `Sort`-Fallback (keine Missing-Field-Verschiebung).
+fn index_order_enabled(
+    schema: &Schema,
+    collection_id: Option<u32>,
+    field: &str,
+    clauses: &[Vec<Lit>],
+) -> bool {
+    let Some(cid) = collection_id else {
+        return false;
+    };
+    let has_ready_index = schema
+        .lookup_field_id(cid, field)
+        .and_then(|fid| schema.find_index(cid, fid))
+        .map(|idx| idx.status == IndexStatus::Ready)
+        .unwrap_or(false);
+    if !has_ready_index {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|clause| clause.iter().any(|l| l.field == field && l.indexable()))
 }
 
 /// Plante einen Logical Plan zu einem Physical Plan (read-only, mutiert nichts).
@@ -359,7 +517,7 @@ pub fn plan(schema: &Schema, logical: LogicalPlan) -> PhysicalPlan {
         // Klausel-Residual; würden wir dieses weglassen, fielen ihre Treffer
         // fälschlich heraus (Or(x, true) ≠ Or(x)). Der Index dient hier nur zur
         // Kandidatenreduktion, der Filter re-prüft exakt die Query-Semantik.
-        if let Some(p) = combined {
+        if let Some(p) = combined.clone() {
             rows = PhysicalPlan::Filter {
                 input: Box::new(rows),
                 pred: p,
@@ -367,8 +525,50 @@ pub fn plan(schema: &Schema, logical: LogicalPlan) -> PhysicalPlan {
         }
     }
 
-    // 3) Sort / Limit.
+    // 3) Sort / Limit. Bei erfüllter Enablement-Regel (`ORDER BY indexed_field
+    //    LIMIT n` mit Presence-Garantie) wird Sort entfernt und ein
+    //    `IndexOrderScan` eingesetzt — bounded, statt `Sort` über allen N.
     if let Some((field, dir)) = sort {
+        if let (Some(n), true) = (
+            limit,
+            index_order_enabled(schema, collection_id, &field, &clauses),
+        ) {
+            let (lower, upper) = union_bounds(&clauses, &field);
+            let mut inner = PhysicalPlan::IndexOrderScan {
+                collection: collection.clone(),
+                field: field.clone(),
+                lower,
+                upper,
+                dir,
+            };
+            // Residual-Filter: bei Ein-Klausel-DNF die übrigen Literale;
+            // bei OR das volle Prädikat (exakt, wie im UnionIds-Pfad).
+            let filter_pred = if clauses.len() == 1 {
+                let residual: Vec<Lit> = clauses[0]
+                    .iter()
+                    .filter(|l| !(l.field == field && l.indexable()))
+                    .cloned()
+                    .collect();
+                if residual.is_empty() {
+                    None
+                } else {
+                    Some(clause_residual(&residual))
+                }
+            } else {
+                combined.clone()
+            };
+            if let Some(p) = filter_pred {
+                inner = PhysicalPlan::Filter {
+                    input: Box::new(inner),
+                    pred: p,
+                };
+            }
+            rows = PhysicalPlan::Limit {
+                input: Box::new(inner),
+                n,
+            };
+            return rows;
+        }
         rows = PhysicalPlan::Sort {
             input: Box::new(rows),
             field,

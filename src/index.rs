@@ -61,7 +61,7 @@ impl FindOp {
 }
 
 /// Der Scan-Bereich im Index-Key-Raum für einen Bereich.
-fn index_range(
+pub(crate) fn index_range(
     collection_id: u32,
     field_id: u32,
     lower: &Bound,
@@ -102,7 +102,7 @@ fn field_value_m<M: Mutator>(
 }
 
 /// Prüft, ob ein Wert in den Bereich fällt.
-fn within(value: &Value, lower: &Bound, upper: &Bound) -> bool {
+pub(crate) fn within(value: &Value, lower: &Bound, upper: &Bound) -> bool {
     use std::cmp::Ordering;
     let lo = match lower {
         Bound::Unbounded => true,
@@ -115,6 +115,19 @@ fn within(value: &Value, lower: &Bound, upper: &Bound) -> bool {
         Bound::Inclusive(v) => ordering::value_cmp(value, v) != Ordering::Greater,
     };
     lo && hi
+}
+
+/// Dekodiert einen Index-Key in `(Wert, Entity-ID)`. `Ok(None)`, wenn der Key
+/// kein Index-Key ist; Fehler bei unlesbarem Wert oder nicht-UTF-8-ID.
+pub(crate) fn decode_index_key_value(key: &[u8]) -> Result<Option<(Value, String)>> {
+    let Some((_c, _f, entity)) = keycodec::decode_index_key(key) else {
+        return Ok(None);
+    };
+    // Layout: [I][cid u32][fid u32][enc_value][len u32][entity_id]
+    let value_len = ordering::ordered_value_len(&key[9..])?;
+    let value = ordering::decode_ordered(&key[9..9 + value_len])?;
+    let eid = crate::keycodec::decode_entity_id(entity)?.to_string();
+    Ok(Some((value, eid)))
 }
 
 /// Führt eine Index-Abfrage über eine beliebige Mutator-Sicht aus. Liefert die

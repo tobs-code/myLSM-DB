@@ -128,6 +128,7 @@ impl<'a> Mutator for TxMutator<'a> {
             committed: Box::new(committed),
             pending: self.pending.iter(),
             pending_buf: None,
+            committed_buf: None,
             start: start.map(Into::into),
             end: end.map(Into::into),
         };
@@ -151,6 +152,7 @@ struct TxScan<'s> {
     committed: crate::ScanStream<'s>,
     pending: std::collections::btree_map::Iter<'s, Vec<u8>, Option<Vec<u8>>>,
     pending_buf: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    committed_buf: Option<(Vec<u8>, Option<Vec<u8>>)>,
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
 }
@@ -169,32 +171,49 @@ impl<'s> TxScan<'s> {
             }
         }
     }
+    fn load_committed(&mut self) -> Result<()> {
+        while self.committed_buf.is_none() {
+            match self.committed.next() {
+                None => break,
+                Some(Err(e)) => return Err(e),
+                Some(Ok(x)) => self.committed_buf = Some(x),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'s> Iterator for TxScan<'s> {
     type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
     fn next(&mut self) -> Option<Self::Item> {
         self.load_pending();
-        let committed = match self.committed.next() {
-            None => None,
-            Some(Err(e)) => return Some(Err(e)),
-            Some(Ok(x)) => Some(x),
-        };
-        match (committed, self.pending_buf.clone()) {
+        if let Err(e) = self.load_committed() {
+            return Some(Err(e));
+        }
+        match (self.committed_buf.take(), self.pending_buf.clone()) {
             (None, None) => None,
+            // Nur noch Pending übrig.
             (None, Some(p)) => {
                 self.pending_buf = None;
                 Some(Ok(p))
             }
+            // Nur noch committed übrig.
             (Some(c), None) => Some(Ok(c)),
-            (Some(c), Some(p)) => {
-                if p.0 <= c.0 {
+            (Some(c), Some(p)) => match p.0.cmp(&c.0) {
+                // Gleicher Key: Pending schattet committed (inkl. Tombstone).
+                std::cmp::Ordering::Equal => {
                     self.pending_buf = None;
                     Some(Ok(p))
-                } else {
-                    Some(Ok(c))
                 }
-            }
+                // Pending ist strikt kleiner: emittieren, committed behalten.
+                std::cmp::Ordering::Less => {
+                    self.committed_buf = Some(c);
+                    self.pending_buf = None;
+                    Some(Ok(p))
+                }
+                // Committed ist kleiner: emittieren, Pending behalten.
+                std::cmp::Ordering::Greater => Some(Ok(c)),
+            },
         }
     }
 }
@@ -711,6 +730,28 @@ impl<'a> Transaction<'a> {
             &lower,
             &upper,
         )
+    }
+
+    /// Startet eine Query auf einer Collection (v0.6, read-only). Existiert die
+    /// Collection nicht, liefert die Query ein leeres Ergebnis — es wird
+    /// **kein** Schema-Eintrag angelegt.
+    pub fn query(&mut self, collection: &str) -> Result<QueryBuilder> {
+        Ok(QueryBuilder::new(collection))
+    }
+
+    /// Plant und führt eine Query **innerhalb der Transaktion** aus (eager über
+    /// das Pending-Overlay). Read-your-own-writes: sieht committete Daten UND
+    /// die eigenen, noch uncommitteten Writes — für Entity- und Index-Daten
+    /// über dasselbe Overlay. Schema bleibt read-only.
+    pub fn execute_query(&mut self, builder: QueryBuilder) -> Result<Vec<(String, Entity)>> {
+        self.check_active()?;
+        let logical = builder.build();
+        let physical = query::planner::plan(&self.store.schema, logical);
+        let mut m = TxMutator {
+            db: &mut self.store.db,
+            pending: &mut self.pending,
+        };
+        query::executor::run_m(&mut m, &self.store.schema, &physical)
     }
 
     /// Committet die Transaktion atomar: WAL (`Begin` → Mutationen → `Commit`),

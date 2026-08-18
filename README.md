@@ -525,6 +525,7 @@ Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` w
 - **Ein Index pro `AND`-Klausel:** keine index-order-Sortierung, kein Cost-Based Optimizer, keine Kardinalitäts-Schätzung — der Planner ist bewusst einfach und regelbasiert.
 - **`Ne` ist kein Index-Zugriff** (es bleibt ein Residual-Filter); `Ne` wird als `Not(Eq)` ausgewertet — konsistent auch für fehlende Felder.
 - **`limit` ohne `sort` = undefinierte Reihenfolge** (dokumentiert; nur mit `sort` ist `limit` deterministisch).
+- **Clippy-Warnings** sind hier bewusst nicht Teil des v0.6-Scope; sie stammen aus älteren Bereichen und werden separat angegangen.
 
 | Komponente | Test-Ergebnis |
 |---|---|
@@ -534,6 +535,26 @@ Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` w
 | Executor (IndexScan/FullScan/Fetch/Filter/Sort/Limit, deterministisch) | ok |
 | Explain (Baum-Darstellung) | ok |
 | Oracle-Test (`tests/query.rs`, 200 Random-Queries vs Full-Scan) | ok |
+
+---
+
+## v0.6 — Query-Ausführung, Cost-Based Indexwahl, Index-Order / Top-K
+
+v0.6 erweitert die Query-Schicht, ohne die Storage-Architektur umzubauen:
+
+- **Transaktionale Queries:** Der Executor läuft über `Mutator`, sodass `get`, `scan_collection`, `find` und Query-Ausführung dieselben Pending-Writes sehen.
+- **Cost-Based Indexwahl:** Der Planner wählt pro DNF-Klausel deterministisch den günstigsten READY-Index über ein kleines Kostenmodell (`Eq < Between < OneSided`), ohne Statistik-Infrastruktur.
+- **Index-Order / Top-K:** Wenn das Sortierfeld in **jeder** DNF-Klausel positiv vorhanden ist und ein READY-Index existiert, wird `ORDER BY indexed_field LIMIT n` als `Limit { Filter { IndexOrderScan } }` geplant. Sonst bleibt der bestehende `Sort`-Fallback unverändert blockierend.
+
+Wichtig ist die Invariante: Presence-Garantie schaltet den geordneten Pfad erst frei. Die Entity-Verifikation bleibt trotzdem Pflicht, damit Index-/Entity-Abweichungen nie sichtbar werden.
+
+**`explain()`-Beispiel mit v0.6-Pfad:**
+
+```text
+Limit { n: 5 }
+  Filter { predicate: age >= 0 }
+    IndexOrderScan { collection: users, field: age, range: [0,]..∅, dir: Asc }
+```
 
 ---
 
@@ -587,6 +608,6 @@ Konsolidierung der **öffentlichen Verträge** — keine neuen Features, keine V
 | **v0.5** -fertig- | Query-Planner/Optimizer: deklarative Queries, DNF, regelbasierte Indexwahl, Residual-Filter, Explain, Full-Scan-Oracle |
 | **v0.5.1** -fertig- | **Lazy-Read-Pfad:** `scan_stream`/`ScanIter` (Snapshot via exklusivem Borrow), `TableIter`-Seek, Lazy-Merge, Pull-Model-Executor (`Limit` = `take`), kein O(DB)-Materialisieren auf dem Lesepfad |
 | **v0.5.2** -fertig- | **API-/Semantik-Härtung:** strikt-UTF-8-Entity-IDs (Write ⇒ `InvalidArgument`, Korruption ⇒ `InvalidFormat`), `Error::InvalidArgument`-Taxonomie, Read-only-Schema-Invariante (Reads mutieren kein Schema) |
-| **v0.6** | Tx-Queries, Cost-Based Optimizer, Index-Order-Sortierung |
+| **v0.6** -fertig- | Query-Ausführung, Tx-Queries, Cost-Based Indexwahl, Index-Order / Top-K |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.

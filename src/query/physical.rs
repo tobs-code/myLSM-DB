@@ -28,6 +28,17 @@ pub enum PhysicalPlan {
     },
     /// Scan über alle Entities einer Collection; liefert `(id, Entity)`.
     FullScan { collection: String },
+    /// Geordneter Index-Scan (v0.6, Teil 3): streamt **verifizierte**
+    /// `(id, Entity)`-Zeilen in Index-Reihenfolge (`dir`) über den Index-Range
+    /// `lower..upper`. Nur einsetzbar, wenn das Feld für jede mögliche Treffer-
+    /// Zeile garantiert vorhanden ist (Presence-Garantie des Planners).
+    IndexOrderScan {
+        collection: String,
+        field: String,
+        lower: Bound,
+        upper: Bound,
+        dir: SortDir,
+    },
     /// Vereinigt die IDs mehrerer Teil-Pläne (OR-Klauseln) und **dedupliziert**.
     /// Die Teil-Pläne müssen allesamt `IndexScan`/`UnionIds` (ID-Quellen) sein.
     UnionIds { branches: Vec<PhysicalPlan> },
@@ -55,7 +66,9 @@ pub enum PhysicalPlan {
 impl PhysicalPlan {
     pub fn input(&self) -> Option<&PhysicalPlan> {
         match self {
-            PhysicalPlan::FullScan { .. } | PhysicalPlan::IndexScan { .. } => None,
+            PhysicalPlan::FullScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::IndexOrderScan { .. } => None,
             PhysicalPlan::UnionIds { .. } => None,
             PhysicalPlan::Fetch { input, .. }
             | PhysicalPlan::Filter { input, .. }
@@ -68,6 +81,7 @@ impl PhysicalPlan {
     pub fn kind(&self) -> &'static str {
         match self {
             PhysicalPlan::IndexScan { .. } => "IndexScan",
+            PhysicalPlan::IndexOrderScan { .. } => "IndexOrderScan",
             PhysicalPlan::FullScan { .. } => "FullScan",
             PhysicalPlan::UnionIds { .. } => "UnionIds",
             PhysicalPlan::Fetch { .. } => "Fetch",
@@ -81,6 +95,7 @@ impl PhysicalPlan {
     pub fn collection(&self) -> Option<&str> {
         match self {
             PhysicalPlan::IndexScan { collection, .. }
+            | PhysicalPlan::IndexOrderScan { collection, .. }
             | PhysicalPlan::FullScan { collection }
             | PhysicalPlan::Fetch { collection, .. } => Some(collection),
             _ => None,

@@ -19,14 +19,14 @@
 
 use std::collections::HashSet;
 
-use crate::codec;
+use crate::codec::{self, Value};
 use crate::entity::{Entity, core_get_entity};
 use crate::error::{Error, Result};
 use crate::index;
 use crate::keycodec;
 use crate::ordering;
 use crate::schema::Schema;
-use crate::{Database, DirectMutator, ScanStream};
+use crate::{Database, DirectMutator, Mutator, ScanStream};
 
 use super::logical::SortDir;
 use super::physical::PhysicalPlan;
@@ -42,34 +42,53 @@ pub fn run(
     schema: &Schema,
     plan: &PhysicalPlan,
 ) -> Result<Vec<(String, Entity)>> {
-    exec_rows(db, schema, plan)?.collect()
+    let mut m = DirectMutator { db };
+    run_m(&mut m, schema, plan)
+}
+
+/// Führt den Plan gegen eine beliebige `Mutator`-Sicht aus (committed via
+/// [`DirectMutator`], transaktional via `TxMutator` mit Pending-Overlay).
+/// Sammelet alle Zeilen ein; eine nicht existierende Collection liefert leer.
+pub fn run_m<M: Mutator>(
+    m: &mut M,
+    schema: &Schema,
+    plan: &PhysicalPlan,
+) -> Result<Vec<(String, Entity)>> {
+    exec_rows(m, schema, plan)?.collect()
 }
 
 /// Baut den Iterator für einen Plan-Knoten (Pull-Modell).
-fn exec_rows<'db>(
-    db: &'db mut Database,
-    schema: &'db Schema,
+fn exec_rows<'m, M: Mutator>(
+    m: &'m mut M,
+    schema: &'m Schema,
     plan: &PhysicalPlan,
-) -> Result<RowStream<'db>> {
+) -> Result<RowStream<'m>> {
     match plan {
-        PhysicalPlan::FullScan { collection } => scan_collection_stream(db, schema, collection),
+        PhysicalPlan::FullScan { collection } => scan_collection_stream(m, schema, collection),
+        PhysicalPlan::IndexOrderScan {
+            collection,
+            field,
+            lower,
+            upper,
+            dir,
+        } => index_order_stream(m, schema, collection, field, lower, upper, *dir),
         PhysicalPlan::IndexScan { .. } => {
-            let ids = candidate_ids(db, schema, plan)?;
+            let ids = candidate_ids(m, schema, plan)?;
             let collection = plan.collection().unwrap_or("");
-            Ok(fetch_stream(db, schema, ids, collection))
+            Ok(fetch_stream(m, schema, ids, collection))
         }
         PhysicalPlan::Fetch { input, collection } => {
-            let ids = candidate_ids(db, schema, input)?;
-            Ok(fetch_stream(db, schema, ids, collection))
+            let ids = candidate_ids(m, schema, input)?;
+            Ok(fetch_stream(m, schema, ids, collection))
         }
         PhysicalPlan::UnionIds { branches } => {
             // Jeder Zweig ist eine Entity-Zeilenquelle (Fetch{IndexScan} oder
-            // FullScan). Da nur EIN `&mut db` gleichzeitig existieren kann,
+            // FullScan). Da nur EIN `&mut M` gleichzeitig existieren kann,
             // werden die Zweige eager eingesammelt und per Entity-ID dedupliziert.
             let mut out: Vec<(String, Entity)> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for branch in branches {
-                for (id, e) in exec_rows(db, schema, branch)?.collect::<Result<Vec<_>>>()? {
+                for (id, e) in exec_rows(m, schema, branch)?.collect::<Result<Vec<_>>>()? {
                     if seen.insert(id.clone()) {
                         out.push((id, e));
                     }
@@ -78,7 +97,7 @@ fn exec_rows<'db>(
             Ok(Box::new(out.into_iter().map(Ok)))
         }
         PhysicalPlan::Filter { input, pred } => {
-            let inner = exec_rows(db, schema, input)?;
+            let inner = exec_rows(m, schema, input)?;
             let pred = pred.clone();
             Ok(Box::new(inner.filter(move |r| {
                 r.as_ref()
@@ -86,13 +105,13 @@ fn exec_rows<'db>(
             })))
         }
         PhysicalPlan::Sort { input, field, dir } => {
-            let inner = exec_rows(db, schema, input)?;
+            let inner = exec_rows(m, schema, input)?;
             let mut rows: Vec<(String, Entity)> = inner.collect::<Result<Vec<_>>>()?;
             sort_rows(&mut rows, field, *dir);
             Ok(Box::new(rows.into_iter().map(Ok)))
         }
         PhysicalPlan::Limit { input, n } => {
-            let inner = exec_rows(db, schema, input)?;
+            let inner = exec_rows(m, schema, input)?;
             Ok(Box::new(inner.take(*n)))
         }
     }
@@ -101,19 +120,23 @@ fn exec_rows<'db>(
 /// Erzeugt die Kandidaten-IDs eines id-produzierenden Plans (IndexScan /
 /// UnionIds). Eager, weil `Fetch` die IDs besitzt und über sie die Entities
 /// einzeln (Punkt-Lookup) nachlädt.
-fn candidate_ids(db: &mut Database, schema: &Schema, plan: &PhysicalPlan) -> Result<Vec<String>> {
+fn candidate_ids<M: Mutator>(
+    m: &mut M,
+    schema: &Schema,
+    plan: &PhysicalPlan,
+) -> Result<Vec<String>> {
     match plan {
         PhysicalPlan::IndexScan {
             collection,
             field,
             lower,
             upper,
-        } => index_scan(db, schema, collection, field, lower, upper),
+        } => index_scan(m, schema, collection, field, lower, upper),
         PhysicalPlan::UnionIds { branches } => {
             let mut out: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for branch in branches {
-                for id in candidate_ids(db, schema, branch)? {
+                for id in candidate_ids(m, schema, branch)? {
                     if seen.insert(id.clone()) {
                         out.push(id);
                     }
@@ -129,18 +152,18 @@ fn candidate_ids(db: &mut Database, schema: &Schema, plan: &PhysicalPlan) -> Res
 }
 
 /// Streamt die Entities einer Collection (FullScan) direkt aus dem Lazy-Scan
-/// der Storage-Schicht — **ohne** die Datenmenge zu materialisieren.
-fn scan_collection_stream<'db>(
-    db: &'db mut Database,
-    schema: &'db Schema,
+/// der gewählten Mutator-Sicht — **ohne** die Datenmenge zu materialisieren.
+fn scan_collection_stream<'m, M: Mutator>(
+    m: &'m mut M,
+    schema: &'m Schema,
     collection: &str,
-) -> Result<RowStream<'db>> {
+) -> Result<RowStream<'m>> {
     let Some(cid) = schema.lookup_collection_id(collection) else {
         return Ok(Box::new(std::iter::empty()));
     };
     let pstart = keycodec::collection_prefix(cid);
     let pend = keycodec::successor(&pstart);
-    let stream = db.scan_stream(Some(&pstart), pend.as_deref())?;
+    let stream = m.scan(Some(&pstart), pend.as_deref())?;
     Ok(Box::new(ScanAssembler {
         stream: Box::new(stream),
         schema,
@@ -151,14 +174,14 @@ fn scan_collection_stream<'db>(
 
 /// Streamt Kandidaten-IDs zu Entities (je Punkt-Lookup). Eine gelöschte/nicht
 /// gefundene Entität entfällt; gefiltert wird hier nie implizit.
-fn fetch_stream<'db>(
-    db: &'db mut Database,
-    schema: &'db Schema,
+fn fetch_stream<'m, M: Mutator>(
+    m: &'m mut M,
+    schema: &'m Schema,
     ids: Vec<String>,
     collection: &str,
-) -> RowStream<'db> {
+) -> RowStream<'m> {
     Box::new(FetchIter {
-        db,
+        m,
         schema,
         cid: schema.lookup_collection_id(collection),
         ids: ids.into_iter(),
@@ -225,20 +248,19 @@ impl<'db> Iterator for ScanAssembler<'db> {
 }
 
 /// Streamt IDs → Entities (Punkt-Lookup).
-struct FetchIter<'db> {
-    db: &'db mut Database,
-    schema: &'db Schema,
+struct FetchIter<'m, M: Mutator> {
+    m: &'m mut M,
+    schema: &'m Schema,
     cid: Option<u32>,
     ids: std::vec::IntoIter<String>,
 }
 
-impl<'db> Iterator for FetchIter<'db> {
+impl<'m, M: Mutator> Iterator for FetchIter<'m, M> {
     type Item = Result<(String, Entity)>;
     fn next(&mut self) -> Option<Self::Item> {
         let cid = self.cid?;
         for id in self.ids.by_ref() {
-            let mut m = DirectMutator { db: &mut *self.db };
-            match core_get_entity(self.schema, &mut m, cid, id.as_bytes()) {
+            match core_get_entity(self.schema, &mut *self.m, cid, id.as_bytes()) {
                 Ok(Some(e)) => return Some(Ok((id, e))),
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e)),
@@ -248,8 +270,8 @@ impl<'db> Iterator for FetchIter<'db> {
     }
 }
 
-fn index_scan(
-    db: &mut Database,
+fn index_scan<M: Mutator>(
+    m: &mut M,
     schema: &Schema,
     collection: &str,
     field: &str,
@@ -265,7 +287,103 @@ fn index_scan(
     if schema.find_index(cid, fid).is_none() {
         return Err(Error::InvalidArgument(format!("no index on field {field}")));
     }
-    index::find(db, schema, cid, fid, lower, upper)
+    index::find_m(m, schema, cid, fid, lower, upper)
+}
+
+/// Baut den (bounded) Index-Order-Scan: sammelt die Kandidaten-IDs des
+/// Index-Ranges `lower..upper` ein und emittiert sie **lazy** in exakt der
+/// `sort_rows`-Ordnung (`dir`), wobei jede Kandidaten-Entity gegen ihren
+/// echten Wert verifiziert wird (Index ist nie die Wahrheit). Ein
+/// vorgeschaltetes `Limit` hört früh auf zu ziehen.
+fn index_order_stream<'m, M: Mutator>(
+    m: &'m mut M,
+    schema: &'m Schema,
+    collection: &str,
+    field: &str,
+    lower: &index::Bound,
+    upper: &index::Bound,
+    dir: SortDir,
+) -> Result<RowStream<'m>> {
+    let Some(cid) = schema.lookup_collection_id(collection) else {
+        return Ok(Box::new(std::iter::empty()));
+    };
+    let Some(fid) = schema.lookup_field_id(cid, field) else {
+        return Err(Error::InvalidArgument(format!("unknown field {field}")));
+    };
+    if schema.find_index(cid, fid).is_none() {
+        return Err(Error::InvalidArgument(format!("no index on field {field}")));
+    }
+    let (start, end) = index::index_range(cid, fid, lower, upper);
+    let stream = m.scan(Some(&start), end.as_deref())?;
+    let mut cands: Vec<(Value, String)> = Vec::new();
+    for row in stream {
+        let (key, _) = row?;
+        if let Some((value, eid)) = index::decode_index_key_value(&key)? {
+            cands.push((value, eid));
+        }
+    }
+    // Deterministische Ordnung identisch zu `sort_rows`: Wert nach `dir`,
+    // bei Gleichstand Entity-ID (immer aufsteigend).
+    let asc = dir == SortDir::Asc;
+    cands.sort_by(|a, b| {
+        let mut o = ordering::value_cmp(&a.0, &b.0);
+        if !asc {
+            o = o.reverse();
+        }
+        if o == std::cmp::Ordering::Equal {
+            a.1.cmp(&b.1)
+        } else {
+            o
+        }
+    });
+    Ok(Box::new(IndexOrderIter {
+        m,
+        schema,
+        cid,
+        fid,
+        lower: lower.clone(),
+        upper: upper.clone(),
+        cands: cands.into_iter(),
+    }))
+}
+
+/// Streamt Kandidaten → verifizierte, geordnete `(id, Entity)`-Zeilen.
+struct IndexOrderIter<'m, M: Mutator> {
+    m: &'m mut M,
+    schema: &'m Schema,
+    cid: u32,
+    fid: u32,
+    lower: index::Bound,
+    upper: index::Bound,
+    cands: std::vec::IntoIter<(Value, String)>,
+}
+
+impl<'m, M: Mutator> Iterator for IndexOrderIter<'m, M> {
+    type Item = Result<(String, Entity)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        for (_value, id) in self.cands.by_ref() {
+            // Verifikation gegen die Entity (Index ist nie die Wahrheit):
+            // fehlendes/gelöschtes Feld oder Wert außerhalb des Bereichs ⇒ skip.
+            let ekey = keycodec::encode_entity_key(self.cid, id.as_bytes(), self.fid);
+            let actual = match self.m.get(&ekey) {
+                Ok(Some(bytes)) => match codec::decode(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                },
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            };
+            if !index::within(&actual, &self.lower, &self.upper) {
+                continue;
+            }
+            match core_get_entity(self.schema, &mut *self.m, self.cid, id.as_bytes()) {
+                Ok(Some(e)) => return Some(Ok((id, e))),
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
 }
 
 /// Deterministisches Sortieren nach `field`; bei Gleichstand über die
