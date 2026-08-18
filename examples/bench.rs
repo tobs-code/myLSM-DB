@@ -38,8 +38,12 @@ fn main() {
     };
     let mut db = Database::open_with(&dir, opts).expect("open");
 
-    let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key-{:08}", i).into_bytes()).collect();
-    let vals: Vec<Vec<u8>> = (0..n).map(|i| format!("value-{}", i).into_bytes()).collect();
+    let keys: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("key-{:08}", i).into_bytes())
+        .collect();
+    let vals: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("value-{}", i).into_bytes())
+        .collect();
 
     println!("== myLSM-DB benchmark: {} keys ==", n);
 
@@ -49,8 +53,12 @@ fn main() {
         db.put(&keys[i], &vals[i]).expect("put");
     }
     let put_elapsed = t.elapsed().as_secs_f64();
-    println!("put:            {:.0} writes/s  ({:.3}s, {} MB total)",
-        n as f64 / put_elapsed, put_elapsed, mb(dir_size(&dir, |_| true)));
+    println!(
+        "put:            {:.0} writes/s  ({:.3}s, {} MB total)",
+        n as f64 / put_elapsed,
+        put_elapsed,
+        mb(dir_size(&dir, |_| true))
+    );
 
     // --- flush erzwingen + Zeit ---
     let t = Instant::now();
@@ -91,15 +99,23 @@ fn main() {
         .iter()
         .map(|(k, v)| (k.len() + v.as_ref().map_or(0, |v| v.len())) as u64)
         .sum();
-    println!("scan:           {:.3} MB/s   ({} rows, {} MB)",
-        scanned_bytes as f64 / scan_elapsed / (1024.0 * 1024.0), scanned.len(), mb(scanned_bytes));
+    println!(
+        "scan:           {:.3} MB/s   ({} rows, {} MB)",
+        scanned_bytes as f64 / scan_elapsed / (1024.0 * 1024.0),
+        scanned.len(),
+        mb(scanned_bytes)
+    );
 
     // --- Datei-Metriken ---
     let wal = dir_size(&dir, |p| p.extension().map_or(false, |e| e == "log"));
     let sst = dir_size(&dir, |p| p.extension().map_or(false, |e| e == "sst"));
     println!("db size:        {:.3} MB", mb(dir_size(&dir, |_| true)));
     println!("  wal:          {:.3} MB", mb(wal));
-    println!("  sstables:     {:.3} MB  ({} tables)", mb(sst), db.table_count());
+    println!(
+        "  sstables:     {:.3} MB  ({} tables)",
+        mb(sst),
+        db.table_count()
+    );
 
     // --- restart + recovery ---
     let t = Instant::now();

@@ -22,8 +22,10 @@ fn scan_range_sorted() {
         db.put(k.as_bytes(), v.as_bytes()).unwrap();
     }
     let all = db.scan(None, None).unwrap();
-    assert_eq!(all.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    assert_eq!(
+        all.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+    );
     let range = db.scan(Some(b"b"), Some(b"d")).unwrap();
     assert_eq!(range.len(), 2);
     assert_eq!(range[0].0, b"b".to_vec());
@@ -39,7 +41,11 @@ fn flush_persists_and_compacts() {
     };
     let mut db = Database::open_with(dir.path(), opts).unwrap();
     for i in 0..50u32 {
-        db.put(format!("key-{:04}", i).as_bytes(), format!("val-{}", i).as_bytes()).unwrap();
+        db.put(
+            format!("key-{:04}", i).as_bytes(),
+            format!("val-{}", i).as_bytes(),
+        )
+        .unwrap();
     }
     // Compaction sollte nach mehreren Flushes Tabellen zusammengeführt haben.
     assert!(db.level_tables(1) >= 1 || db.table_count() > 0);
@@ -80,7 +86,11 @@ fn recovery_after_flush_and_compaction() {
     {
         let mut db = Database::open_with(dir.path(), opts.clone()).unwrap();
         for i in 0..30u32 {
-            db.put(format!("k{:03}", i).as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+            db.put(
+                format!("k{:03}", i).as_bytes(),
+                format!("v{}", i).as_bytes(),
+            )
+            .unwrap();
         }
     }
     drop(opts);

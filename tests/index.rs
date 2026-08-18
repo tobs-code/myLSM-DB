@@ -142,7 +142,12 @@ fn oracle_index_matches_full_scan_after_random_mutations() {
         assert_eq!(got, exp, "Between({lo},{hi})");
     }
     for v in [-1i64, 0, 31, 100] {
-        for op in [FindOp::Gt(Value::Int(v)), FindOp::Gte(Value::Int(v)), FindOp::Lt(Value::Int(v)), FindOp::Lte(Value::Int(v))] {
+        for op in [
+            FindOp::Gt(Value::Int(v)),
+            FindOp::Gte(Value::Int(v)),
+            FindOp::Lt(Value::Int(v)),
+            FindOp::Lte(Value::Int(v)),
+        ] {
             let got = sorted(col.find("age", op.clone()).unwrap());
             let exp = expected_ids(&all, &op);
             assert_eq!(got, exp, "range {v:?}");

@@ -22,10 +22,7 @@ mod tests {
     fn builds_sorted_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.sst");
-        let records = vec![
-            (b"a".to_vec(), Some(b"1".to_vec())),
-            (b"b".to_vec(), None),
-        ];
+        let records = vec![(b"a".to_vec(), Some(b"1".to_vec())), (b"b".to_vec(), None)];
         let n = build_table_from_sorted(&path, &records).unwrap();
         assert_eq!(n, 2);
         let mut r = crate::sstable::TableReader::open(&path).unwrap();

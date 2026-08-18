@@ -19,7 +19,12 @@ pub const INDEX_TAG: u8 = b'I'; // 0x49
 /// ```
 /// `encoded_value` ist ordnungserhaltend und selbst-delimitierend (siehe
 /// [`crate::ordering`]), sodass die entity_id direkt folgen kann.
-pub fn encode_index_key(collection_id: u32, field_id: u32, encoded_value: &[u8], entity_id: &[u8]) -> Vec<u8> {
+pub fn encode_index_key(
+    collection_id: u32,
+    field_id: u32,
+    encoded_value: &[u8],
+    entity_id: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + 4 + encoded_value.len() + 4 + entity_id.len());
     out.push(INDEX_TAG);
     out.extend_from_slice(&collection_id.to_le_bytes());
@@ -182,7 +187,10 @@ mod tests {
         // Feld-Keys von "123"
         for f in [1u32, 2, 3] {
             let k = encode_entity_key(1, b"123", f);
-            assert!(k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice(), "field {f} in range");
+            assert!(
+                k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice(),
+                "field {f} in range"
+            );
         }
         // Andere Entities müssen außerhalb liegen.
         let other1 = encode_entity_key(1, b"122", 1);

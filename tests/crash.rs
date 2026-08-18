@@ -17,7 +17,8 @@ fn crash_tester() -> &'static str {
 #[test]
 fn crash_recovery_no_corruption() {
     for run in 0..RUNS {
-        let dir: PathBuf = std::env::temp_dir().join(format!("lsm_crash_{}_{}", std::process::id(), run));
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("lsm_crash_{}_{}", std::process::id(), run));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Seed: schreibt N Keys und killt sich an einem zufälligen Punkt.

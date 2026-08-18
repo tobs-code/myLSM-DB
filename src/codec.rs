@@ -93,14 +93,18 @@ pub fn decode(data: &[u8]) -> Result<Value> {
         }
         TAG_STRING => {
             let (len, s) = read_len_prefix(data)?;
-            let bytes = s.get(..len).ok_or_else(|| Error::InvalidFormat("string too short".into()))?;
+            let bytes = s
+                .get(..len)
+                .ok_or_else(|| Error::InvalidFormat("string too short".into()))?;
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| Error::InvalidFormat("invalid utf8 string".into()))?;
             Ok(Value::String(text.to_string()))
         }
         TAG_BYTES => {
             let (len, s) = read_len_prefix(data)?;
-            let bytes = s.get(..len).ok_or_else(|| Error::InvalidFormat("bytes too short".into()))?;
+            let bytes = s
+                .get(..len)
+                .ok_or_else(|| Error::InvalidFormat("bytes too short".into()))?;
             Ok(Value::Bytes(bytes.to_vec()))
         }
         other => Err(Error::InvalidFormat(format!("unknown value tag {other}"))),
@@ -137,7 +141,7 @@ mod tests {
         roundtrip(Value::Int(i64::MIN));
         roundtrip(Value::Int(i64::MAX));
         roundtrip(Value::Float(0.0));
-        roundtrip(Value::Float(-3.14));
+        roundtrip(Value::Float(-3.5));
         roundtrip(Value::Float(f64::NEG_INFINITY));
         roundtrip(Value::String(String::new()));
         roundtrip(Value::String("hello".into()));

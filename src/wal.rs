@@ -32,7 +32,6 @@ impl Wal {
         let file = OpenOptions::new()
             .create(true)
             .read(false)
-            .write(true)
             .append(true)
             .open(path)?;
         Ok(Wal {

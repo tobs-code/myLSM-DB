@@ -35,7 +35,11 @@ fn smoke_survives_flush_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut store = EntityStore::open(dir.path()).unwrap();
-        store.collection("users").unwrap().put("123", &user()).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .put("123", &user())
+            .unwrap();
         // close() flusht die MemTable in eine SSTable + persistiert das Schema.
         store.close().unwrap();
     }

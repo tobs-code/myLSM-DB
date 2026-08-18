@@ -50,9 +50,7 @@ impl MemTable {
         start: Bound<Vec<u8>>,
         end: Bound<Vec<u8>>,
     ) -> impl Iterator<Item = (&[u8], &Entry)> {
-        self.map
-            .range((start, end))
-            .map(|(k, v)| (k.as_slice(), v))
+        self.map.range((start, end)).map(|(k, v)| (k.as_slice(), v))
     }
 
     /// Liefert einen Iterator über ALLE Einträge.

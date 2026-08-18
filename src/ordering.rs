@@ -17,7 +17,7 @@
 //! (NaN ist deterministisch das Maximum, `-0.0` sortiert knapp vor `+0.0`).
 //! Dieselbe Ordnung gilt in Encode, Range-Scan und Verifikation.
 
-use crate::codec::{Value, TAG_BOOL, TAG_BYTES, TAG_FLOAT, TAG_INT, TAG_NULL, TAG_STRING};
+use crate::codec::{TAG_BOOL, TAG_BYTES, TAG_FLOAT, TAG_INT, TAG_NULL, TAG_STRING, Value};
 
 /// Totale Ordnung zweier Werte, konsistent mit [`encode_ordered`].
 /// NaN ist das Maximum; `-0.0` sortiert knapp vor `+0.0`.
@@ -58,20 +58,26 @@ fn type_rank(v: &Value) -> u8 {
 /// Index-Key) eindeutig lokalisiert werden können.
 pub fn ordered_value_len(data: &[u8]) -> crate::error::Result<usize> {
     if data.is_empty() {
-        return Err(crate::error::Error::InvalidFormat("empty ordered value".into()));
+        return Err(crate::error::Error::InvalidFormat(
+            "empty ordered value".into(),
+        ));
     }
     match data[0] {
         TAG_NULL => Ok(1),
         TAG_BOOL => {
             if data.len() < 2 {
-                Err(crate::error::Error::InvalidFormat("bool ordered too short".into()))
+                Err(crate::error::Error::InvalidFormat(
+                    "bool ordered too short".into(),
+                ))
             } else {
                 Ok(2)
             }
         }
         TAG_INT | TAG_FLOAT => {
             if data.len() < 9 {
-                Err(crate::error::Error::InvalidFormat("numeric ordered too short".into()))
+                Err(crate::error::Error::InvalidFormat(
+                    "numeric ordered too short".into(),
+                ))
             } else {
                 Ok(9)
             }
@@ -81,7 +87,9 @@ pub fn ordered_value_len(data: &[u8]) -> crate::error::Result<usize> {
             while i < data.len() {
                 if data[i] == 0 {
                     if i + 1 >= data.len() {
-                        return Err(crate::error::Error::InvalidFormat("truncated terminator".into()));
+                        return Err(crate::error::Error::InvalidFormat(
+                            "truncated terminator".into(),
+                        ));
                     }
                     if data[i + 1] == 0 {
                         return Ok(i + 2); // Terminator 0x00 0x00
@@ -94,9 +102,13 @@ pub fn ordered_value_len(data: &[u8]) -> crate::error::Result<usize> {
                 }
                 i += 1;
             }
-            Err(crate::error::Error::InvalidFormat("missing terminator".into()))
+            Err(crate::error::Error::InvalidFormat(
+                "missing terminator".into(),
+            ))
         }
-        t => Err(crate::error::Error::InvalidFormat(format!("unknown ordered tag {t}"))),
+        t => Err(crate::error::Error::InvalidFormat(format!(
+            "unknown ordered tag {t}"
+        ))),
     }
 }
 
@@ -168,7 +180,9 @@ fn escape_null_free(data: &[u8], out: &mut Vec<u8>) {
 /// Dekodiert einen ordnungserhaltend kodierten Wert (für Tests).
 pub fn decode_ordered(data: &[u8]) -> crate::error::Result<Value> {
     if data.is_empty() {
-        return Err(crate::error::Error::InvalidFormat("empty ordered value".into()));
+        return Err(crate::error::Error::InvalidFormat(
+            "empty ordered value".into(),
+        ));
     }
     let tag = data[0];
     let payload = &data[1..];
@@ -176,36 +190,49 @@ pub fn decode_ordered(data: &[u8]) -> crate::error::Result<Value> {
         TAG_NULL => Ok(Value::Null),
         TAG_BOOL => {
             if payload.is_empty() {
-                return Err(crate::error::Error::InvalidFormat("bool ordered too short".into()));
+                return Err(crate::error::Error::InvalidFormat(
+                    "bool ordered too short".into(),
+                ));
             }
             Ok(Value::Bool(payload[0] != 0))
         }
         TAG_INT => {
             if payload.len() < 8 {
-                return Err(crate::error::Error::InvalidFormat("int ordered too short".into()));
+                return Err(crate::error::Error::InvalidFormat(
+                    "int ordered too short".into(),
+                ));
             }
             let bits = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             Ok(Value::Int((bits ^ (1u64 << 63)) as i64))
         }
         TAG_FLOAT => {
             if payload.len() < 8 {
-                return Err(crate::error::Error::InvalidFormat("float ordered too short".into()));
+                return Err(crate::error::Error::InvalidFormat(
+                    "float ordered too short".into(),
+                ));
             }
             let bits = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             if bits == u64::MAX {
                 return Ok(Value::Float(f64::NAN));
             }
-            let bits = if bits >> 63 == 1 { bits ^ (1 << 63) } else { !bits };
+            let bits = if bits >> 63 == 1 {
+                bits ^ (1 << 63)
+            } else {
+                !bits
+            };
             Ok(Value::Float(f64::from_bits(bits)))
         }
         TAG_STRING => {
             let raw = unescape_null_free(payload)?;
-            let s = std::str::from_utf8(&raw)
-                .map_err(|_| crate::error::Error::InvalidFormat("ordered string not utf8".into()))?;
+            let s = std::str::from_utf8(&raw).map_err(|_| {
+                crate::error::Error::InvalidFormat("ordered string not utf8".into())
+            })?;
             Ok(Value::String(s.to_string()))
         }
         TAG_BYTES => Ok(Value::Bytes(unescape_null_free(payload)?)),
-        t => Err(crate::error::Error::InvalidFormat(format!("unknown ordered tag {t}"))),
+        t => Err(crate::error::Error::InvalidFormat(format!(
+            "unknown ordered tag {t}"
+        ))),
     }
 }
 
@@ -216,11 +243,15 @@ fn unescape_null_free(data: &[u8]) -> crate::error::Result<Vec<u8>> {
         if data[i] == 0 {
             // Terminator 0x00 0x00, danach darf nichts mehr kommen.
             if i + 1 >= data.len() {
-                return Err(crate::error::Error::InvalidFormat("truncated terminator".into()));
+                return Err(crate::error::Error::InvalidFormat(
+                    "truncated terminator".into(),
+                ));
             }
             if data[i + 1] == 0 {
                 if i + 2 != data.len() {
-                    return Err(crate::error::Error::InvalidFormat("trailing bytes after terminator".into()));
+                    return Err(crate::error::Error::InvalidFormat(
+                        "trailing bytes after terminator".into(),
+                    ));
                 }
                 return Ok(out);
             } else if data[i + 1] == 1 {
@@ -235,7 +266,9 @@ fn unescape_null_free(data: &[u8]) -> crate::error::Result<Vec<u8>> {
             i += 1;
         }
     }
-    Err(crate::error::Error::InvalidFormat("missing terminator".into()))
+    Err(crate::error::Error::InvalidFormat(
+        "missing terminator".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -289,11 +322,12 @@ mod tests {
     #[test]
     fn string_order_preserved() {
         let mut rng = Rng(0xBEAD);
-        let mut vals: Vec<String> = (0..2000).map(|_| {
-            let bytes = rng.next_bytes(12);
-            String::from_utf8_lossy(&bytes).into_owned()
-        })
-        .collect();
+        let mut vals: Vec<String> = (0..2000)
+            .map(|_| {
+                let bytes = rng.next_bytes(12);
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+            .collect();
         // Bewusst auch Fälle mit Nullen und Präfix-Beziehungen.
         vals.push("".into());
         vals.push("a".into());
@@ -355,9 +389,9 @@ mod tests {
         // Alle NaN kollabieren auf einen Wert → dedup (nur strikte Ordnung prüfen).
         let mut seen: Vec<f64> = Vec::new();
         for v in vals {
-            let dup = seen.last().map_or(false, |l| {
-                ordered_f64_bits(*l) == ordered_f64_bits(v)
-            });
+            let dup = seen
+                .last()
+                .map_or(false, |l| ordered_f64_bits(*l) == ordered_f64_bits(v));
             if !dup {
                 seen.push(v);
             }
@@ -404,10 +438,14 @@ mod tests {
     #[test]
     fn string_escapes_terminator_correctly() {
         // Leerer String ist kleiner als "a" (Terminator 00 00 < 61 ...).
-        assert!(encode_ordered(&Value::String(String::new()))
-            < encode_ordered(&Value::String("a".into())));
+        assert!(
+            encode_ordered(&Value::String(String::new()))
+                < encode_ordered(&Value::String("a".into()))
+        );
         // "a" ist Präfix von "a\0b".
-        assert!(encode_ordered(&Value::String("a".into()))
-            < encode_ordered(&Value::String("a\0b".into())));
+        assert!(
+            encode_ordered(&Value::String("a".into()))
+                < encode_ordered(&Value::String("a\0b".into()))
+        );
     }
 }

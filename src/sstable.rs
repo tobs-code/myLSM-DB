@@ -41,7 +41,8 @@ impl TableBuilder {
 
         if self.keys_since_index == 0 {
             // Index-Eintrag am Anfang eines Blocks
-            self.index.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            self.index
+                .extend_from_slice(&(key.len() as u32).to_le_bytes());
             self.index.extend_from_slice(key);
             self.index.extend_from_slice(&offset.to_le_bytes());
         }
@@ -52,8 +53,10 @@ impl TableBuilder {
 
         self.bloom.insert(key);
 
-        self.buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        self.buf.extend_from_slice(&(value.map_or(0, |v| v.len()) as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(value.map_or(0, |v| v.len()) as u32).to_le_bytes());
         self.buf.push(flags);
         self.buf.extend_from_slice(key);
         if let Some(v) = value {
@@ -243,13 +246,11 @@ impl TableReader {
         loop {
             match self.read_record()? {
                 None => return Ok(None),
-                Some((k, v)) => {
-                    match k.as_slice().cmp(key) {
-                        std::cmp::Ordering::Equal => return Ok(Some(v)),
-                        std::cmp::Ordering::Greater => return Ok(None),
-                        std::cmp::Ordering::Less => continue,
-                    }
-                }
+                Some((k, v)) => match k.as_slice().cmp(key) {
+                    std::cmp::Ordering::Equal => return Ok(Some(v)),
+                    std::cmp::Ordering::Greater => return Ok(None),
+                    std::cmp::Ordering::Less => continue,
+                },
             }
         }
     }
