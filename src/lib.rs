@@ -12,8 +12,8 @@ pub mod schema;
 pub mod sstable;
 pub mod wal;
 
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use error::Result;
 use iterator::{MergedIter, ReadSnapshot};
@@ -54,6 +54,8 @@ pub struct Database {
     closed: bool,
     /// Geöffnete SSTable-Reader, nach Tabellen-ID. Wird bei Flush/Compaction invalidiert.
     table_cache: HashMap<u64, sstable::TableReader>,
+    /// Nächste frei zu vergebende Transaktions-ID (nie wiederverwendet).
+    next_tx_id: u64,
 }
 
 impl Database {
@@ -88,13 +90,17 @@ impl Database {
             opts,
             closed: false,
             table_cache: HashMap::new(),
+            next_tx_id: 0,
         };
 
-        // Recovery: WAL in die MemTable einspielen.
-        let records = wal::replay(&db.wal_path)?;
-        for rec in records {
+        // Recovery: WAL in die MemTable einspielen. Die höchste gesehene
+        // Transaktions-ID (auch uncommitteter) übernehmen, damit nach einem
+        // Crash keine TX-ID in demselben WAL wiederverwendet wird.
+        let replay = wal::replay(&db.wal_path)?;
+        for rec in replay.records {
             db.memtable.put(rec.key, rec.value);
         }
+        db.next_tx_id = replay.max_tx_id + 1;
 
         Ok(db)
     }
@@ -121,6 +127,59 @@ impl Database {
         Ok(())
     }
 
+    /// Vergibt eine monotone, niemals wiederverwendete Transaktions-ID.
+    pub(crate) fn alloc_tx_id(&mut self) -> u64 {
+        let id = self.next_tx_id;
+        self.next_tx_id += 1;
+        id
+    }
+
+    /// Schreibt eine `Begin`-Markierung für `tx` in den WAL-Puffer.
+    pub(crate) fn wal_begin(&mut self, tx: u64) -> Result<()> {
+        self.wal.append_begin(tx)
+    }
+
+    /// Schreibt eine `TxPut`-Mutation für `tx` in den WAL-Puffer.
+    pub(crate) fn wal_tx_put(&mut self, tx: u64, key: &[u8], value: &[u8]) -> Result<()> {
+        self.wal.append_tx_put(tx, key, value)
+    }
+
+    /// Schreibt eine `TxDelete`-Mutation für `tx` in den WAL-Puffer.
+    pub(crate) fn wal_tx_delete(&mut self, tx: u64, key: &[u8]) -> Result<()> {
+        self.wal.append_tx_delete(tx, key)
+    }
+
+    /// Schreibt eine `Commit`-Markierung für `tx` in den WAL-Puffer.
+    pub(crate) fn wal_commit(&mut self, tx: u64) -> Result<()> {
+        self.wal.append_commit(tx)
+    }
+
+    /// Leert den WAL-Puffer und macht ihn dauerhaft (fsync) — der Commit-Point.
+    pub(crate) fn wal_sync(&mut self) -> Result<()> {
+        self.wal.sync()
+    }
+
+    /// Wendet eine committete Mutation NUR auf die MemTable an (kein WAL-Write).
+    /// Infallibel: Ein Committeter `Commit`-Record ist bereits durable, das
+    /// MemTable-Apply danach darf nicht mehr fehlschlagen.
+    pub(crate) fn mem_put(&mut self, key: &[u8], value: &[u8]) {
+        self.memtable.put(key.to_vec(), Some(value.to_vec()));
+    }
+
+    /// Wendet eine committete Löschung NUR auf die MemTable an. Infallibel.
+    pub(crate) fn mem_delete(&mut self, key: &[u8]) {
+        self.memtable.put(key.to_vec(), None);
+    }
+
+    /// Best-Effort-Flush, falls die MemTable das Limit überschritten hat.
+    /// Nach einem Commit ist die Durability über den WAL gesichert, ein
+    /// Flush-Fehler hier ist also nicht kritisch.
+    pub(crate) fn flush_if_over_limit(&mut self) -> Result<()> {
+        if self.memtable.size_bytes() >= self.opts.memtable_limit {
+            self.flush()?;
+        }
+        Ok(())
+    }
     /// Holt einen Wert. `None` = nicht vorhanden oder gelöscht.
     ///
     /// Gezielter Punkt-Lookup statt voller Snapshot: prüft die MemTable (neueste
@@ -159,7 +218,11 @@ impl Database {
     }
 
     /// Bereichs-Scan [start, end). Liefert sortierte (key, Option<value>).
-    pub fn scan(&mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    pub fn scan(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         let snapshot = self.read_snapshot()?;
         let merged: Vec<_> = snapshot.merge().collect();
         Ok(merged
@@ -177,7 +240,11 @@ impl Database {
         if self.memtable.is_empty() {
             return Ok(());
         }
-        let records: Vec<(Vec<u8>, Entry)> = self.memtable.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+        let records: Vec<(Vec<u8>, Entry)> = self
+            .memtable
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect();
 
         let id = self.manifest.next_table_id;
         self.manifest.next_table_id += 1;
@@ -272,7 +339,11 @@ impl Database {
 
     fn read_snapshot(&mut self) -> Result<ReadSnapshot> {
         let mut snapshot = ReadSnapshot::empty();
-        snapshot.memtable = self.memtable.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+        snapshot.memtable = self
+            .memtable
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect();
         for level in 0..self.manifest.levels.len() {
             snapshot.levels.push(self.merge_level(level));
         }
@@ -321,5 +392,48 @@ impl Drop for Database {
             let _ = self.flush();
             let _ = self.wal.sync();
         }
+    }
+}
+
+/// Abstraktion über eine KV-Sicht für Reads + Writes. Einerseits die direkte
+/// (committete) Engine (`DirectMutator`), andererseits eine Transaktions-Sicht
+/// mit Pending-Overlay (`TxMutator`). So teilen sich nicht-transaktionale und
+/// transaktionale Pfade dieselbe Entity-/Index-Logik.
+pub trait Mutator {
+    /// Punkt-Lookup. `None` = nicht vorhanden oder gelöscht.
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// Bereichs-Scan `[start, end)`, sortiert.
+    fn scan(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>>;
+    /// Schreibt (bzw. überschreibt) einen Key.
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+    /// Löscht einen Key (Tombstone).
+    fn delete(&mut self, key: &[u8]) -> Result<()>;
+}
+
+/// Mutator direkt auf der committeten Engine (nicht-transaktionaler Pfad).
+pub struct DirectMutator<'a> {
+    pub db: &'a mut Database,
+}
+
+impl<'a> Mutator for DirectMutator<'a> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db.get(key)
+    }
+    fn scan(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        self.db.scan(start, end)
+    }
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.put(key, value)
+    }
+    fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.db.delete(key)
     }
 }

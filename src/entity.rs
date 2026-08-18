@@ -8,7 +8,14 @@
 //!
 //! Die KV-Engine (`Database`) kennt diese Schicht NICHT — die Abhängigkeit
 //! geht nur in eine Richtung.
+//!
+//! Seit v0.4 gibt es Transaktionen: Ein `Transaction` überlagert die committete
+//! Engine mit einem Pending-Puffer (`TxMutator`), sodass Reads eigene Writes
+//! sehen. Erst `commit()` macht die Pending-Mutationen über einen atomaren
+//! WAL-Block (`Begin` → `TxPut`/`TxDelete` → `Commit` → fsync) dauerhaft und
+//! wendet sie auf die MemTable an.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Index;
 use std::path::PathBuf;
 
@@ -18,7 +25,7 @@ use crate::index::{self, FindOp};
 use crate::keycodec;
 use crate::ordering;
 use crate::schema::{IndexStatus, Schema};
-use crate::Database;
+use crate::{Database, DirectMutator, Mutator};
 
 /// Eine rekonstruierte Entität: eine (geordnete) Liste benannter getypter Werte.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -68,6 +75,289 @@ pub struct CollectionHandle<'a> {
     collection_id: u32,
 }
 
+/// Zustand einer Transaktion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxState {
+    Active,
+    Committed,
+    Aborted,
+}
+
+/// Eine (Einzel-)Transaktion über einem [`EntityStore`].
+///
+/// - Reads (`get`/`scan_collection`/`find`) sehen committete Daten UND die
+///   eigenen, noch uncommitteten Schreiboperationen (Read-your-own-writes).
+/// - Writes (`update`/`delete`) werden nur in den Pending-Puffer geschrieben;
+///   nichts wird persistent, solange nicht `commit()` gerufen wird.
+/// - `commit()` schreibt atomar `Begin` → `TxPut`/`TxDelete` → `Commit` in die
+///   WAL, führt ein `fsync` (= Commit-Point) aus und wendet danach alle
+///   Mutationen auf die MemTable an. Nach dem `Commit`-Record im WAL darf das
+///   MemTable-Apply nicht mehr fehlschlagen.
+/// - `abort()`/`drop` ohne Commit: Pending wird verworfen, es ist nichts
+///   dauerhaft (auch der WAL wurde nicht berührt).
+///
+/// Es gibt bewusst keine Concurrency: `Transaction` lehnt sich an
+/// `&mut EntityStore` an, sodass nur eine Transaktion pro Store gleichzeitig
+/// existieren kann.
+pub struct Transaction<'a> {
+    store: &'a mut EntityStore,
+    id: u64,
+    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    state: TxState,
+}
+
+/// Transaktionale KV-Sicht: committed Engine überlagert mit dem Pending-Puffer.
+/// Lookup-Reihenfolge: **Pending zuerst, dann committed.** Bei `scan()` ein
+/// Merge aus committed + pending, wobei Pending (inkl. Tombstones) gewinnt.
+struct TxMutator<'a> {
+    db: &'a mut Database,
+    pending: &'a mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl<'a> Mutator for TxMutator<'a> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(v) = self.pending.get(key) {
+            return Ok(v.clone());
+        }
+        self.db.get(key)
+    }
+    fn scan(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        let committed = self.db.scan(start, end)?;
+        let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = committed.into_iter().collect();
+        for (k, v) in self.pending.iter() {
+            let in_start = start.is_none_or(|s| k.as_slice() >= s);
+            let in_end = end.is_none_or(|e| k.as_slice() < e);
+            if in_start && in_end {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(map.into_iter().collect())
+    }
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.pending.insert(key.to_vec(), Some(value.to_vec()));
+        Ok(())
+    }
+    fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.pending.insert(key.to_vec(), None);
+        Ok(())
+    }
+}
+
+/// READY-Index-Feld-IDs einer Collection.
+fn indexed_field_ids(schema: &Schema, collection_id: u32) -> Vec<u32> {
+    schema
+        .indexes()
+        .iter()
+        .filter(|i| i.collection_id == collection_id && i.status == IndexStatus::Ready)
+        .map(|i| i.field_id)
+        .collect()
+}
+
+/// Kern-Implementierung von `put_entity`, generalisiert über eine Mutator-Sicht
+/// (committed ODER transaktional). Pflegt ggf. Sekundärindizes — in dieser
+/// Reihenfolge, damit der Index temporär immer ein Superset (nie ein Subset)
+/// der korrekten Einträge ist:
+///
+/// ```text
+/// 1. PUT neuer Index-Eintrag
+/// 2. PUT Entity (neue Felder) / DELETE veraltete Entity-Felder
+/// 3. DELETE alter Index-Eintrag (erst wenn die Entity den Wert nicht mehr hat)
+/// ```
+fn core_put_entity(
+    schema: &mut Schema,
+    m: &mut impl Mutator,
+    collection_id: u32,
+    entity_id: &[u8],
+    entity: &Entity,
+) -> Result<()> {
+    // Zuerst alle Feld-IDs vergeben. Persistiert wird vom Caller (Commit bzw.
+    // nicht-transaktionaler Pfad), damit eine abgebrochene Transaktion kein
+    // Schema schreibt, BEVOR sie committed ist.
+    let mut written: Vec<(u32, &Value)> = Vec::with_capacity(entity.fields.len());
+    for (name, value) in &entity.fields {
+        let field_id = schema.field_id(collection_id, name);
+        written.push((field_id, value));
+    }
+
+    // Bisherige Felder der Entität ermitteln (für Stale-Removal + Index-Diff).
+    let (start, end) = keycodec::entity_range(collection_id, entity_id);
+    let existing = m.scan(Some(&start), end.as_deref())?;
+    let mut old_values: HashMap<u32, Value> = HashMap::new();
+    for (key, value_opt) in &existing {
+        if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
+            if let Some(v) = value_opt {
+                if let Ok(val) = codec::decode(v) {
+                    old_values.insert(field_id, val);
+                }
+            }
+        }
+    }
+
+    // 1) Neue Index-Einträge für geänderte/neu indexierte Felder schreiben
+    //    (Bevor die Entity aktualisiert wird → kein False Negative).
+    let indexed = indexed_field_ids(schema, collection_id);
+    for (field_id, value) in &written {
+        if !indexed.contains(field_id) {
+            continue;
+        }
+        let changed = old_values.get(field_id) != Some(value);
+        if changed {
+            let ik = keycodec::encode_index_key(
+                collection_id,
+                *field_id,
+                &ordering::encode_ordered(value),
+                entity_id,
+            );
+            m.put(&ik, &[])?;
+        }
+    }
+
+    // 2) Entity-Felder schreiben + veraltete entfernen.
+    let new_field_ids: HashSet<u32> = written.iter().map(|(f, _)| *f).collect();
+    for (key, _) in &existing {
+        if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
+            if !new_field_ids.contains(&field_id) {
+                m.delete(key)?;
+            }
+        }
+    }
+    for (field_id, value) in &written {
+        let key = keycodec::encode_entity_key(collection_id, entity_id, *field_id);
+        let enc = codec::encode(value);
+        m.put(&key, &enc)?;
+    }
+
+    // 3) Alte Index-Einträge löschen — erst nachdem die Entity den Wert
+    //    nicht mehr hat (sonst entstünde ein False Negative).
+    for (field_id, old_value) in &old_values {
+        if !indexed.contains(field_id) {
+            continue;
+        }
+        let now_has_same = written
+            .iter()
+            .any(|(f, v)| f == field_id && *v == old_value);
+        if !now_has_same {
+            let ik = keycodec::encode_index_key(
+                collection_id,
+                *field_id,
+                &ordering::encode_ordered(old_value),
+                entity_id,
+            );
+            m.delete(&ik)?;
+        }
+    }
+    Ok(())
+}
+
+/// Kern-Implementierung von `delete_entity`, generalisiert über eine Mutator-Sicht.
+fn core_delete_entity(
+    schema: &mut Schema,
+    m: &mut impl Mutator,
+    collection_id: u32,
+    entity_id: &[u8],
+) -> Result<()> {
+    let (start, end) = keycodec::entity_range(collection_id, entity_id);
+    let rows = m.scan(Some(&start), end.as_deref())?;
+    // Erst die Feldwerte einsammeln (für die Index-Bereinigung) und die
+    // Entity-Keys löschen; danach die Index-Einträge entfernen.
+    let indexed = indexed_field_ids(schema, collection_id);
+    let mut index_ops: Vec<(u32, Value)> = Vec::new();
+    for (key, value_opt) in &rows {
+        if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
+            if indexed.contains(&field_id) {
+                if let Some(v) = value_opt {
+                    if let Ok(val) = codec::decode(v) {
+                        index_ops.push((field_id, val));
+                    }
+                }
+            }
+            m.delete(key)?;
+        }
+    }
+    for (field_id, value) in index_ops {
+        let ik = keycodec::encode_index_key(
+            collection_id,
+            field_id,
+            &ordering::encode_ordered(&value),
+            entity_id,
+        );
+        m.delete(&ik)?;
+    }
+    Ok(())
+}
+
+/// Kern-Implementierung von `get_entity`, generalisiert über eine Mutator-Sicht.
+fn core_get_entity(
+    schema: &Schema,
+    m: &mut impl Mutator,
+    collection_id: u32,
+    entity_id: &[u8],
+) -> Result<Option<Entity>> {
+    let (start, end) = keycodec::entity_range(collection_id, entity_id);
+    let rows = m.scan(Some(&start), end.as_deref())?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut entity = Entity::new();
+    for (key, value_opt) in rows {
+        let (_, _, field_id) = keycodec::decode_entity_key(&key)
+            .ok_or_else(|| Error::InvalidFormat("bad entity key".into()))?;
+        let value = match value_opt {
+            Some(v) => codec::decode(&v)?,
+            None => continue, // Tombstone, kein Feld.
+        };
+        let name = schema
+            .field_name(collection_id, field_id)
+            .ok_or_else(|| Error::InvalidFormat(format!("unknown field id {field_id}")))?;
+        entity.fields.push((name.to_string(), value));
+    }
+    // Nur eine Entität liefern, wenn mindestens ein lebendes Feld existiert.
+    // (Eine komplett gelöschte Entität hat nur Tombstones → None.)
+    if entity.fields.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(entity))
+}
+
+/// Kern-Implementierung von `scan_collection`, generalisiert über eine Mutator-Sicht.
+fn core_scan_collection(
+    schema: &Schema,
+    m: &mut impl Mutator,
+    collection_id: u32,
+) -> Result<Vec<(String, Entity)>> {
+    let pstart = keycodec::collection_prefix(collection_id);
+    let pend = keycodec::successor(&pstart);
+    let rows = m.scan(Some(&pstart), pend.as_deref())?;
+    let mut map: BTreeMap<Vec<u8>, Entity> = Default::default();
+    for (key, value_opt) in rows {
+        let Some((_, ee, ef)) = keycodec::decode_entity_key(&key) else {
+            continue;
+        };
+        let Some(bytes) = value_opt else {
+            continue; // Tombstone.
+        };
+        let value = codec::decode(&bytes)?;
+        let name = schema
+            .field_name(collection_id, ef)
+            .ok_or_else(|| Error::InvalidFormat(format!("unknown field id {ef}")))?;
+        map.entry(ee.to_vec())
+            .or_default()
+            .fields
+            .push((name.to_string(), value));
+    }
+    let mut out = Vec::with_capacity(map.len());
+    for (ee, entity) in map {
+        if !entity.fields.is_empty() {
+            out.push((String::from_utf8_lossy(&ee).into_owned(), entity));
+        }
+    }
+    Ok(out)
+}
+
 impl EntityStore {
     /// Öffnet (oder erstellt) einen Entitäts-Store in `dir`. Legt darunter eine
     /// v0.1-KV-Engine an und lädt das persistente Schema.
@@ -76,7 +366,11 @@ impl EntityStore {
         let db = Database::open(dir)?;
         let schema_path = dir.join("SCHEMA");
         let schema = Schema::load(&schema_path)?;
-        let mut store = EntityStore { db, schema, schema_path };
+        let mut store = EntityStore {
+            db,
+            schema,
+            schema_path,
+        };
         // Noch nicht fertige Indizes (BUILDING nach einem Crash) neu aufbauen.
         store.recover_indexes()?;
         Ok(store)
@@ -87,7 +381,41 @@ impl EntityStore {
     pub fn collection<'a>(&'a mut self, name: &str) -> Result<CollectionHandle<'a>> {
         let collection_id = self.schema.collection_id(name);
         self.persist_schema()?;
-        Ok(CollectionHandle { store: self, collection_id })
+        Ok(CollectionHandle {
+            store: self,
+            collection_id,
+        })
+    }
+
+    /// Eröffnet eine neue Transaktion. Solange `tx` lebt, ist der Store
+    /// exklusiv (keine parallelen Schreiber).
+    pub fn transaction(&mut self) -> Result<Transaction<'_>> {
+        let id = self.db.alloc_tx_id();
+        Ok(Transaction {
+            store: self,
+            id,
+            pending: BTreeMap::new(),
+            state: TxState::Active,
+        })
+    }
+
+    /// Bequemlichkeits-Wrapper: führt `f` in einer Transaktion aus und
+    /// committet bei `Ok`, bricht bei `Err` ab.
+    pub fn transaction_with<T>(
+        &mut self,
+        f: impl FnOnce(&mut Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut tx = self.transaction()?;
+        match f(&mut tx) {
+            Ok(v) => {
+                tx.commit()?;
+                Ok(v)
+            }
+            Err(e) => {
+                tx.abort()?;
+                Err(e)
+            }
+        }
     }
 
     pub fn close(mut self) -> Result<()> {
@@ -104,31 +432,8 @@ impl EntityStore {
     pub fn scan_collection(&mut self, name: &str) -> Result<Vec<(String, Entity)>> {
         let collection_id = self.schema.collection_id(name);
         self.persist_schema()?;
-        let pstart = keycodec::collection_prefix(collection_id);
-        let pend = keycodec::successor(&pstart);
-        let rows = self.db.scan(Some(&pstart), pend.as_deref())?;
-        let mut map: std::collections::BTreeMap<Vec<u8>, Entity> = Default::default();
-        for (key, value_opt) in rows {
-            let Some((_, ee, ef)) = keycodec::decode_entity_key(&key) else {
-                continue;
-            };
-            let Some(bytes) = value_opt else {
-                continue; // Tombstone.
-            };
-            let value = codec::decode(&bytes)?;
-            let name = self
-                .schema
-                .field_name(collection_id, ef)
-                .ok_or_else(|| Error::InvalidFormat(format!("unknown field id {ef}")))?;
-            map.entry(ee.to_vec()).or_default().fields.push((name.to_string(), value));
-        }
-        let mut out = Vec::with_capacity(map.len());
-        for (ee, entity) in map {
-            if !entity.fields.is_empty() {
-                out.push((String::from_utf8_lossy(&ee).into_owned(), entity));
-            }
-        }
-        Ok(out)
+        let mut m = DirectMutator { db: &mut self.db };
+        core_scan_collection(&self.schema, &mut m, collection_id)
     }
 
     /// Schreibt ein neues Schema, falls sich die Registry seit dem letzten
@@ -140,167 +445,33 @@ impl EntityStore {
         Ok(())
     }
 
-    /// Legt eine Entität an bzw. ersetzt sie. Nicht mehr vorhandene Felder der
-    /// bisherigen Entität werden entfernt, sodass der gespeicherte Zustand exakt
-    /// dem übergebenen `Entity` entspricht.
-    ///
-    /// Pflegt ggf. Sekundärindizes — in dieser Reihenfolge, damit der Index
-    /// temporär immer ein Superset (nie ein Subset) der korrekten Einträge ist:
-    ///
-    /// ```text
-    /// 1. PUT neuer Index-Eintrag
-    /// 2. PUT Entity (neue Felder) / DELETE veraltete Entity-Felder
-    /// 3. DELETE alter Index-Eintrag (erst wenn die Entity den Wert nicht mehr hat)
-    /// ```
-    fn put_entity(&mut self, collection_id: u32, entity_id: &[u8], entity: &Entity) -> Result<()> {
-        // Zuerst alle Feld-IDs vergeben und das (geänderte) Schema persistieren,
-        // BEVOR dauerhafte Entitätsdaten geschrieben werden — sonst könnte nach
-        // einem Crash eine Feld-ID eine andere Bedeutung haben.
-        let mut written: Vec<(u32, &Value)> = Vec::with_capacity(entity.fields.len());
-        for (name, value) in &entity.fields {
-            let field_id = self.schema.field_id(collection_id, name);
-            written.push((field_id, value));
+    /// Legt eine Entität an bzw. ersetzt sie (nicht-transaktional).
+    pub fn put_entity(
+        &mut self,
+        collection_id: u32,
+        entity_id: &[u8],
+        entity: &Entity,
+    ) -> Result<()> {
+        {
+            let schema = &mut self.schema;
+            let mut m = DirectMutator { db: &mut self.db };
+            core_put_entity(schema, &mut m, collection_id, entity_id, entity)?;
         }
-        self.persist_schema()?;
-
-        // Bisherige Felder der Entität ermitteln (für Stale-Removal + Index-Diff).
-        let (start, end) = keycodec::entity_range(collection_id, entity_id);
-        let existing = self.db.scan(Some(&start), end.as_deref())?;
-        let mut old_values: std::collections::HashMap<u32, Value> = std::collections::HashMap::new();
-        for (key, value_opt) in &existing {
-            if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-                if let Some(v) = value_opt {
-                    if let Ok(val) = codec::decode(v) {
-                        old_values.insert(field_id, val);
-                    }
-                }
-            }
-        }
-
-        // 1) Neue Index-Einträge für geänderte/neu indexierte Felder schreiben
-        //    (Bevor die Entity aktualisiert wird → kein False Negative).
-        let indexed: Vec<u32> = self
-            .schema
-            .indexes()
-            .iter()
-            .filter(|i| i.collection_id == collection_id && i.status == IndexStatus::Ready)
-            .map(|i| i.field_id)
-            .collect();
-        for (field_id, value) in &written {
-            if !indexed.contains(field_id) {
-                continue;
-            }
-            let changed = old_values.get(field_id) != Some(value);
-            if changed {
-                let ik = keycodec::encode_index_key(
-                    collection_id,
-                    *field_id,
-                    &ordering::encode_ordered(value),
-                    entity_id,
-                );
-                self.db.put(&ik, &[])?;
-            }
-        }
-
-        // 2) Entity-Felder schreiben + veraltete entfernen.
-        let new_field_ids: std::collections::HashSet<u32> =
-            written.iter().map(|(f, _)| *f).collect();
-        for (key, _) in &existing {
-            if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-                if !new_field_ids.contains(&field_id) {
-                    self.db.delete(key)?;
-                }
-            }
-        }
-        for (field_id, value) in &written {
-            let key = keycodec::encode_entity_key(collection_id, entity_id, *field_id);
-            let enc = codec::encode(value);
-            self.db.put(&key, &enc)?;
-        }
-
-        // 3) Alte Index-Einträge löschen — erst nachdem die Entity den Wert
-        //    nicht mehr hat (sonst entstünde ein False Negative).
-        for (field_id, old_value) in &old_values {
-            if !indexed.contains(field_id) {
-                continue;
-            }
-            let now_has_same = written.iter().any(|(f, v)| f == field_id && *v == old_value);
-            if !now_has_same {
-                let ik = keycodec::encode_index_key(
-                    collection_id,
-                    *field_id,
-                    &ordering::encode_ordered(old_value),
-                    entity_id,
-                );
-                self.db.delete(&ik)?;
-            }
-        }
-        Ok(())
+        self.persist_schema()
     }
 
     /// Liest eine Entität vollständig aus ihren Feld-Keys und rekonstruiert sie.
-    fn get_entity(&mut self, collection_id: u32, entity_id: &[u8]) -> Result<Option<Entity>> {
-        let (start, end) = keycodec::entity_range(collection_id, entity_id);
-        let rows = self.db.scan(Some(&start), end.as_deref())?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let mut entity = Entity::new();
-        for (key, value_opt) in rows {
-            let (_, _, field_id) = keycodec::decode_entity_key(&key)
-                .ok_or_else(|| Error::InvalidFormat("bad entity key".into()))?;
-            let value = match value_opt {
-                Some(v) => codec::decode(&v)?,
-                None => continue, // Tombstone, kein Feld.
-            };
-            let name = self
-                .schema
-                .field_name(collection_id, field_id)
-                .ok_or_else(|| Error::InvalidFormat(format!("unknown field id {field_id}")))?;
-            entity.fields.push((name.to_string(), value));
-        }
-        // Nur eine Entität liefern, wenn mindestens ein lebendes Feld existiert.
-        // (Eine komplett gelöschte Entität hat nur Tombstones → None.)
-        if entity.fields.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(entity))
+    pub fn get_entity(&mut self, collection_id: u32, entity_id: &[u8]) -> Result<Option<Entity>> {
+        let mut m = DirectMutator { db: &mut self.db };
+        core_get_entity(&self.schema, &mut m, collection_id, entity_id)
     }
 
     /// Löscht alle Feld-Keys einer Entität (und deren Index-Einträge).
-    fn delete_entity(&mut self, collection_id: u32, entity_id: &[u8]) -> Result<()> {
-        let (start, end) = keycodec::entity_range(collection_id, entity_id);
-        let rows = self.db.scan(Some(&start), end.as_deref())?;
-        // Erst die Feldwerte einsammeln (für die Index-Bereinigung) und die
-        // Entity-Keys löschen; danach die Index-Einträge entfernen.
-        let indexed: Vec<u32> = self
-            .schema
-            .indexes()
-            .iter()
-            .filter(|i| i.collection_id == collection_id && i.status == IndexStatus::Ready)
-            .map(|i| i.field_id)
-            .collect();
-        let mut index_ops: Vec<(u32, Value)> = Vec::new();
-        for (key, value_opt) in &rows {
-            if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-                if indexed.contains(&field_id) {
-                    if let Some(v) = value_opt {
-                        if let Ok(val) = codec::decode(v) {
-                            index_ops.push((field_id, val));
-                        }
-                    }
-                }
-                self.db.delete(key)?;
-            }
-        }
-        for (field_id, value) in index_ops {
-            let ik = keycodec::encode_index_key(
-                collection_id,
-                field_id,
-                &ordering::encode_ordered(&value),
-                entity_id,
-            );
-            self.db.delete(&ik)?;
+    pub fn delete_entity(&mut self, collection_id: u32, entity_id: &[u8]) -> Result<()> {
+        {
+            let schema = &mut self.schema;
+            let mut m = DirectMutator { db: &mut self.db };
+            core_delete_entity(schema, &mut m, collection_id, entity_id)?;
         }
         Ok(())
     }
@@ -338,6 +509,203 @@ impl EntityStore {
             self.create_index(c, f)?;
         }
         Ok(())
+    }
+}
+
+impl<'a> Transaction<'a> {
+    fn check_active(&self) -> Result<()> {
+        if self.state != TxState::Active {
+            return Err(Error::InvalidFormat("transaction is not active".into()));
+        }
+        Ok(())
+    }
+
+    /// Transaktions-ID (monoton, nie wiederverwendet).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Legt eine Entität an bzw. ersetzt sie innerhalb der Transaktion.
+    pub fn update(&mut self, collection: &str, entity_id: &str, entity: &Entity) -> Result<()> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let (schema, db, pending) = (
+            &mut self.store.schema,
+            &mut self.store.db,
+            &mut self.pending,
+        );
+        let mut m = TxMutator { db, pending };
+        core_put_entity(schema, &mut m, collection_id, entity_id.as_bytes(), entity)
+    }
+
+    /// Löscht eine Entität innerhalb der Transaktion.
+    pub fn delete(&mut self, collection: &str, entity_id: &str) -> Result<()> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let (schema, db, pending) = (
+            &mut self.store.schema,
+            &mut self.store.db,
+            &mut self.pending,
+        );
+        let mut m = TxMutator { db, pending };
+        core_delete_entity(schema, &mut m, collection_id, entity_id.as_bytes())
+    }
+
+    /// Liest eine Entität — committed + eigene uncommittete Writes.
+    pub fn get(&mut self, collection: &str, entity_id: &str) -> Result<Option<Entity>> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let (start, end) = keycodec::entity_range(collection_id, entity_id.as_bytes());
+        let rows = {
+            let mut m = TxMutator {
+                db: &mut self.store.db,
+                pending: &mut self.pending,
+            };
+            m.scan(Some(&start), end.as_deref())?
+        };
+        core_get_entity(
+            &self.store.schema,
+            &mut DirectScan { rows: &rows },
+            collection_id,
+            entity_id.as_bytes(),
+        )
+    }
+
+    /// Scannt alle Entities einer Collection — committed + eigene Writes.
+    pub fn scan_collection(&mut self, collection: &str) -> Result<Vec<(String, Entity)>> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let rows = {
+            let mut m = TxMutator {
+                db: &mut self.store.db,
+                pending: &mut self.pending,
+            };
+            let pstart = keycodec::collection_prefix(collection_id);
+            let pend = keycodec::successor(&pstart);
+            m.scan(Some(&pstart), pend.as_deref())?
+        };
+        core_scan_collection(
+            &self.store.schema,
+            &mut DirectScan { rows: &rows },
+            collection_id,
+        )
+    }
+
+    /// Index-Abfrage — committed + eigene uncommittete Index-Writes.
+    pub fn find(&mut self, collection: &str, field: &str, op: FindOp) -> Result<Vec<String>> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let field_id = self
+            .store
+            .schema
+            .lookup_field_id(collection_id, field)
+            .ok_or_else(|| Error::InvalidFormat(format!("unknown field {field}")))?;
+        let (lower, upper) = op.to_bounds();
+        let mut m = TxMutator {
+            db: &mut self.store.db,
+            pending: &mut self.pending,
+        };
+        index::find_m(
+            &mut m,
+            &self.store.schema,
+            collection_id,
+            field_id,
+            &lower,
+            &upper,
+        )
+    }
+
+    /// Committet die Transaktion atomar: WAL (`Begin` → Mutationen → `Commit`),
+    /// dann `fsync` (Commit-Point), dann MemTable-Apply. Idempotent.
+    pub fn commit(&mut self) -> Result<()> {
+        self.check_active()?;
+        // Schema-Registry (neu vergebene Collection-/Feld-IDs) persistieren.
+        self.store.persist_schema()?;
+        let tx = self.id;
+        {
+            let db = &mut self.store.db;
+            db.wal_begin(tx)?;
+            for (key, value) in &self.pending {
+                match value {
+                    Some(v) => db.wal_tx_put(tx, key, v)?,
+                    None => db.wal_tx_delete(tx, key)?,
+                }
+            }
+            db.wal_commit(tx)?;
+            db.wal_sync()?; // COMMIT POINT — ab hier durable.
+        }
+        // Post-Commit: MemTable-Apply darf nicht mehr fehlschlagen. Die
+        // Mutationen sind bereits über den WAL durable; ein Flush-Fehler hier
+        // ist best-effort (Durability bleibt über den WAL erhalten).
+        {
+            let db = &mut self.store.db;
+            for (key, value) in &self.pending {
+                match value {
+                    Some(v) => db.mem_put(key, v),
+                    None => db.mem_delete(key),
+                }
+            }
+            let _ = db.flush_if_over_limit();
+        }
+        self.state = TxState::Committed;
+        Ok(())
+    }
+
+    /// Bricht die Transaktion ab: verwirft alle uncommitteten Writes. Es wurde
+    /// noch nichts Persistentes geschrieben, daher ist hier nichts zu tun.
+    pub fn abort(&mut self) -> Result<()> {
+        self.check_active()?;
+        self.pending.clear();
+        self.state = TxState::Aborted;
+        Ok(())
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        // Kein WAL-Write ohne Commit → nichts zu bereinigen. Pending verfällt.
+        if self.state == TxState::Active {
+            self.pending.clear();
+        }
+    }
+}
+
+/// Adaptiert eine fertige `Vec<(key, Option<value>)>` als Lesesicht (für die
+/// Kern-Funktionen nach einem Overlay-Scan). Schreiboperationen sind unsinnig
+/// und geben einen Fehler zurück.
+struct DirectScan<'a> {
+    rows: &'a Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl<'a> Mutator for DirectScan<'a> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .and_then(|(_, v)| v.clone()))
+    }
+    fn scan(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        Ok(self
+            .rows
+            .iter()
+            .filter(|(k, _)| {
+                let in_start = start.is_none_or(|s| k.as_slice() >= s);
+                let in_end = end.is_none_or(|e| k.as_slice() < e);
+                in_start && in_end
+            })
+            .cloned()
+            .collect())
+    }
+    fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        Err(Error::InvalidFormat("read-only view".into()))
+    }
+    fn delete(&mut self, _key: &[u8]) -> Result<()> {
+        Err(Error::InvalidFormat("read-only view".into()))
     }
 }
 
@@ -409,9 +777,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = EntityStore::open(dir.path()).unwrap();
         let entity = user("Tobias", 31, true);
-        store.collection("users").unwrap().put("usr_123", &entity).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .put("usr_123", &entity)
+            .unwrap();
 
-        let got = store.collection("users").unwrap().get("usr_123").unwrap().expect("exists");
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("usr_123")
+            .unwrap()
+            .expect("exists");
         assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
         assert_eq!(got.field("age"), Some(&Value::Int(31)));
         assert_eq!(got.field("active"), Some(&Value::Bool(true)));
@@ -432,7 +809,12 @@ mod tests {
         e.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(32);
         store.collection("users").unwrap().put("u1", &e).unwrap();
 
-        let got = store.collection("users").unwrap().get("u1").unwrap().expect("exists");
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
         assert_eq!(got.field("age"), Some(&Value::Int(32)));
         assert!(got.field("active").is_none(), "stale field must be removed");
         assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
@@ -444,9 +826,23 @@ mod tests {
         let mut store = EntityStore::open(dir.path()).unwrap();
         let e = user("Tobias", 31, true);
         store.collection("users").unwrap().put("u1", &e).unwrap();
-        assert!(store.collection("users").unwrap().get("u1").unwrap().is_some());
+        assert!(
+            store
+                .collection("users")
+                .unwrap()
+                .get("u1")
+                .unwrap()
+                .is_some()
+        );
         store.collection("users").unwrap().delete("u1").unwrap();
-        assert!(store.collection("users").unwrap().get("u1").unwrap().is_none());
+        assert!(
+            store
+                .collection("users")
+                .unwrap()
+                .get("u1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -460,7 +856,12 @@ mod tests {
         }
         // Neu öffnen: IDs müssen identisch bleiben, sonst wäre das Feld unlesbar.
         let mut store = EntityStore::open(dir.path()).unwrap();
-        let got = store.collection("users").unwrap().get("u1").unwrap().expect("exists");
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
         assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
         assert_eq!(got.field("age"), Some(&Value::Int(31)));
     }
@@ -479,5 +880,294 @@ mod tests {
         store.collection("doc").unwrap().put("d1", &e).unwrap();
         let got = store.collection("doc").unwrap().get("d1").unwrap().unwrap();
         assert_eq!(got, e);
+    }
+
+    fn ids(v: Vec<String>) -> Vec<String> {
+        let mut v = v;
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn transaction_commits_atomically_with_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .create_index("age")
+            .unwrap();
+        let e1 = user("Tobias", 31, true);
+        let e2 = user("Anna", 40, false);
+        store
+            .transaction_with(|tx| {
+                tx.update("users", "u1", &e1)?;
+                tx.update("users", "u2", &e2)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut col = store.collection("users").unwrap();
+        assert_eq!(
+            col.get("u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(31))
+        );
+        assert_eq!(
+            col.get("u2").unwrap().unwrap().field("age"),
+            Some(&Value::Int(40))
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(31))).unwrap()),
+            vec!["u1"]
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(40))).unwrap()),
+            vec!["u2"]
+        );
+    }
+
+    #[test]
+    fn transaction_abort_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .create_index("age")
+            .unwrap();
+        let e = user("Tobias", 31, true);
+        let mut tx = store.transaction().unwrap();
+        tx.update("users", "u1", &e).unwrap();
+        tx.abort().unwrap();
+        drop(tx);
+
+        let mut col = store.collection("users").unwrap();
+        assert!(col.get("u1").unwrap().is_none());
+        assert!(
+            col.find("age", FindOp::Eq(Value::Int(31)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transaction_with_error_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let e = user("Tobias", 31, true);
+        let res: Result<()> = store.transaction_with(|tx| {
+            tx.update("users", "u1", &e)?;
+            Err(crate::error::Error::NotFound)
+        });
+        assert!(res.is_err());
+
+        let mut col = store.collection("users").unwrap();
+        assert!(col.get("u1").unwrap().is_none());
+    }
+
+    #[test]
+    fn tx_reads_own_writes_for_get_scan_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let e = user("Tobias", 31, true);
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .create_index("age")
+            .unwrap();
+
+        let mut tx = store.transaction().unwrap();
+        // Committete Base ist sichtbar.
+        assert_eq!(
+            tx.get("users", "u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(31))
+        );
+        assert_eq!(
+            ids(tx.find("users", "age", FindOp::Eq(Value::Int(31))).unwrap()),
+            vec!["u1"]
+        );
+
+        // update A → get/scan/find sehen 32.
+        let mut e32 = e.clone();
+        e32.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(32);
+        tx.update("users", "u1", &e32).unwrap();
+        assert_eq!(
+            tx.get("users", "u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(32))
+        );
+        let scan = tx.scan_collection("users").unwrap();
+        assert_eq!(scan[0].1.field("age"), Some(&Value::Int(32)));
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(31)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(tx.find("users", "age", FindOp::Eq(Value::Int(32))).unwrap()),
+            vec!["u1"]
+        );
+        tx.commit().unwrap();
+        drop(tx);
+
+        // Nach Commit ist das auch ausserhalb sichtbar.
+        let mut col = store.collection("users").unwrap();
+        assert_eq!(
+            col.get("u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(32))
+        );
+    }
+
+    #[test]
+    fn tx_read_your_own_writes_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        {
+            let mut col = store.collection("users").unwrap();
+            col.create_index("age").unwrap();
+            col.put("u1", &user("x", 30, true)).unwrap();
+        }
+
+        let mut tx = store.transaction().unwrap();
+        // put A, put A, put A
+        tx.update("users", "u1", &user("x", 31, true)).unwrap();
+        tx.update("users", "u1", &user("x", 32, true)).unwrap();
+        tx.update("users", "u1", &user("x", 33, true)).unwrap();
+        assert_eq!(
+            tx.get("users", "u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(33))
+        );
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(30)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(31)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(32)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(tx.find("users", "age", FindOp::Eq(Value::Int(33))).unwrap()),
+            vec!["u1"]
+        );
+        tx.commit().unwrap();
+        drop(tx);
+
+        // put A, delete A
+        let mut tx = store.transaction().unwrap();
+        tx.update("users", "u1", &user("x", 40, true)).unwrap();
+        tx.delete("users", "u1").unwrap();
+        assert!(tx.get("users", "u1").unwrap().is_none());
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(40)))
+                .unwrap()
+                .is_empty()
+        );
+        tx.commit().unwrap();
+        drop(tx);
+        assert!(
+            store
+                .collection("users")
+                .unwrap()
+                .get("u1")
+                .unwrap()
+                .is_none()
+        );
+
+        // delete A, put A
+        let mut tx = store.transaction().unwrap();
+        tx.delete("users", "u1").unwrap();
+        tx.update("users", "u1", &user("x", 50, true)).unwrap();
+        assert_eq!(
+            tx.get("users", "u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(50))
+        );
+        assert_eq!(
+            ids(tx.find("users", "age", FindOp::Eq(Value::Int(50))).unwrap()),
+            vec!["u1"]
+        );
+        tx.commit().unwrap();
+        drop(tx);
+
+        // update A, update A, delete A, put A
+        let mut tx = store.transaction().unwrap();
+        tx.update("users", "u1", &user("x", 51, true)).unwrap();
+        tx.update("users", "u1", &user("x", 52, true)).unwrap();
+        tx.delete("users", "u1").unwrap();
+        tx.update("users", "u1", &user("x", 53, true)).unwrap();
+        assert_eq!(
+            tx.get("users", "u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(53))
+        );
+        assert_eq!(
+            ids(tx.find("users", "age", FindOp::Eq(Value::Int(53))).unwrap()),
+            vec!["u1"]
+        );
+        assert!(
+            tx.find("users", "age", FindOp::Eq(Value::Int(52)))
+                .unwrap()
+                .is_empty()
+        );
+        tx.commit().unwrap();
+        drop(tx);
+
+        let mut col = store.collection("users").unwrap();
+        assert_eq!(
+            col.get("u1").unwrap().unwrap().field("age"),
+            Some(&Value::Int(53))
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(53))).unwrap()),
+            vec!["u1"]
+        );
+    }
+
+    #[test]
+    fn crash_before_commit_discards_tx() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = user("Tobias", 31, true);
+        {
+            let mut store = EntityStore::open(dir.path()).unwrap();
+            let mut tx = store.transaction().unwrap();
+            tx.update("users", "u1", &e).unwrap();
+            // Kein commit → wie ein Crash / Abbruch. Pending wird nie angewandt.
+            drop(tx);
+        }
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        assert!(
+            store
+                .collection("users")
+                .unwrap()
+                .get("u1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn crash_after_commit_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = user("Tobias", 31, true);
+        {
+            let mut store = EntityStore::open(dir.path()).unwrap();
+            let mut tx = store.transaction().unwrap();
+            tx.update("users", "u1", &e).unwrap();
+            tx.commit().unwrap();
+            drop(tx);
+        }
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
+        assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
     }
 }

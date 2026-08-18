@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::keycodec;
 use crate::ordering;
 use crate::schema::Schema;
-use crate::Database;
+use crate::{Database, DirectMutator, Mutator};
 
 /// Unter-/Obergrenze eines Index-Bereichs.
 #[derive(Debug, Clone)]
@@ -61,13 +61,22 @@ impl FindOp {
 }
 
 /// Der Scan-Bereich im Index-Key-Raum für einen Bereich.
-fn index_range(collection_id: u32, field_id: u32, lower: &Bound, upper: &Bound) -> (Vec<u8>, Option<Vec<u8>>) {
+fn index_range(
+    collection_id: u32,
+    field_id: u32,
+    lower: &Bound,
+    upper: &Bound,
+) -> (Vec<u8>, Option<Vec<u8>>) {
     let fp = |f: u32| keycodec::index_field_prefix(collection_id, f);
-    let vp = |f: u32, v: &Value| keycodec::index_value_prefix(collection_id, f, &ordering::encode_ordered(v));
+    let vp = |f: u32, v: &Value| {
+        keycodec::index_value_prefix(collection_id, f, &ordering::encode_ordered(v))
+    };
     let start = match lower {
         Bound::Unbounded => fp(field_id),
         Bound::Inclusive(v) => vp(field_id, v),
-        Bound::Exclusive(v) => keycodec::successor(&vp(field_id, v)).unwrap_or_else(|| fp(field_id)),
+        Bound::Exclusive(v) => {
+            keycodec::successor(&vp(field_id, v)).unwrap_or_else(|| fp(field_id))
+        }
     };
     let end = match upper {
         Bound::Unbounded => keycodec::successor(&fp(field_id)),
@@ -79,9 +88,14 @@ fn index_range(collection_id: u32, field_id: u32, lower: &Bound, upper: &Bound) 
 
 /// Liefert den tatsächlichen Wert eines Feldes einer Entity (oder `None`,
 /// wenn das Feld fehlt/gelöscht ist). Verifikationspfad.
-fn field_value(db: &mut Database, collection_id: u32, entity_id: &[u8], field_id: u32) -> Result<Option<Value>> {
+fn field_value_m<M: Mutator>(
+    m: &mut M,
+    collection_id: u32,
+    entity_id: &[u8],
+    field_id: u32,
+) -> Result<Option<Value>> {
     let key = keycodec::encode_entity_key(collection_id, entity_id, field_id);
-    match db.get(&key)? {
+    match m.get(&key)? {
         Some(bytes) => codec::decode(&bytes).map(Some),
         None => Ok(None),
     }
@@ -103,11 +117,13 @@ fn within(value: &Value, lower: &Bound, upper: &Bound) -> bool {
     lo && hi
 }
 
-/// Führt eine Index-Abfrage aus. Liefert die **verifizierten** Entity-IDs.
+/// Führt eine Index-Abfrage über eine beliebige Mutator-Sicht aus. Liefert die
+/// **verifizierten** Entity-IDs. Ein fehlender Index auf dem Feld ist ein Fehler.
 ///
-/// Ein fehlender Index auf dem Feld ist ein Fehler.
-pub fn find(
-    db: &mut Database,
+/// Der Mutator-Pfad erlaubt es, innerhalb einer Transaktion über das
+/// Pending-Overlay zu suchen (Read-your-own-writes).
+pub(crate) fn find_m<M: Mutator>(
+    m: &mut M,
     schema: &Schema,
     collection_id: u32,
     field_id: u32,
@@ -118,7 +134,7 @@ pub fn find(
         return Err(Error::InvalidFormat("no index on field".into()));
     }
     let (start, end) = index_range(collection_id, field_id, lower, upper);
-    let rows = db.scan(Some(&start), end.as_deref())?;
+    let rows = m.scan(Some(&start), end.as_deref())?;
     let mut ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for (key, _) in rows {
@@ -129,7 +145,7 @@ pub fn find(
             continue;
         }
         // Verifikation gegen die Entity (Index ist nie die Wahrheit).
-        if let Some(actual) = field_value(db, collection_id, entity, field_id)? {
+        if let Some(actual) = field_value_m(m, collection_id, entity, field_id)? {
             if within(&actual, lower, upper) {
                 ids.push(eid);
             }
@@ -138,9 +154,27 @@ pub fn find(
     Ok(ids)
 }
 
+/// Führt eine Index-Abfrage auf der committeten Engine aus.
+pub fn find(
+    db: &mut Database,
+    schema: &Schema,
+    collection_id: u32,
+    field_id: u32,
+    lower: &Bound,
+    upper: &Bound,
+) -> Result<Vec<String>> {
+    let mut m = DirectMutator { db };
+    find_m(&mut m, schema, collection_id, field_id, lower, upper)
+}
+
 /// Löscht alle Index-Keys eines (collection, field).
 pub fn clear(db: &mut Database, collection_id: u32, field_id: u32) -> Result<()> {
-    let (start, end) = index_range(collection_id, field_id, &Bound::Unbounded, &Bound::Unbounded);
+    let (start, end) = index_range(
+        collection_id,
+        field_id,
+        &Bound::Unbounded,
+        &Bound::Unbounded,
+    );
     let rows = db.scan(Some(&start), end.as_deref())?;
     for (key, _) in rows {
         db.delete(&key)?;
@@ -203,12 +237,32 @@ mod tests {
         col.put("u3", &u("u3", 31)).unwrap();
         col.put("u4", &u("u4", 40)).unwrap();
 
-        assert_eq!(ids(col.find("age", FindOp::Eq(Value::Int(31))).unwrap()), vec!["u2", "u3"]);
-        assert_eq!(ids(col.find("age", FindOp::Gte(Value::Int(31))).unwrap()), vec!["u2", "u3", "u4"]);
-        assert_eq!(ids(col.find("age", FindOp::Gt(Value::Int(31))).unwrap()), vec!["u4"]);
-        assert_eq!(ids(col.find("age", FindOp::Lt(Value::Int(31))).unwrap()), vec!["u1"]);
-        assert_eq!(ids(col.find("age", FindOp::Lte(Value::Int(31))).unwrap()), vec!["u1", "u2", "u3"]);
-        assert_eq!(ids(col.find("age", FindOp::Between(Value::Int(30), Value::Int(31))).unwrap()), vec!["u1", "u2", "u3"]);
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(31))).unwrap()),
+            vec!["u2", "u3"]
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Gte(Value::Int(31))).unwrap()),
+            vec!["u2", "u3", "u4"]
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Gt(Value::Int(31))).unwrap()),
+            vec!["u4"]
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Lt(Value::Int(31))).unwrap()),
+            vec!["u1"]
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Lte(Value::Int(31))).unwrap()),
+            vec!["u1", "u2", "u3"]
+        );
+        assert_eq!(
+            ids(col
+                .find("age", FindOp::Between(Value::Int(30), Value::Int(31)))
+                .unwrap()),
+            vec!["u1", "u2", "u3"]
+        );
     }
 
     #[test]
@@ -218,16 +272,30 @@ mod tests {
         let mut col = store.collection("users").unwrap();
         col.create_index("age").unwrap();
         col.put("u1", &u("u1", 30)).unwrap();
-        assert_eq!(ids(col.find("age", FindOp::Eq(Value::Int(30))).unwrap()), vec!["u1"]);
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(30))).unwrap()),
+            vec!["u1"]
+        );
 
         // Update 30 → 31: altes Index-Key weg, neues da.
         col.put("u1", &u("u1", 31)).unwrap();
-        assert!(col.find("age", FindOp::Eq(Value::Int(30))).unwrap().is_empty());
-        assert_eq!(ids(col.find("age", FindOp::Eq(Value::Int(31))).unwrap()), vec!["u1"]);
+        assert!(
+            col.find("age", FindOp::Eq(Value::Int(30)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(31))).unwrap()),
+            vec!["u1"]
+        );
 
         // Delete: keine Treffer mehr.
         col.delete("u1").unwrap();
-        assert!(col.find("age", FindOp::Eq(Value::Int(31))).unwrap().is_empty());
+        assert!(
+            col.find("age", FindOp::Eq(Value::Int(31)))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -247,6 +315,9 @@ mod tests {
         col.put("u1", &u("u1", 30)).unwrap();
         col.put("u2", &u("u2", 30)).unwrap();
         col.create_index("age").unwrap();
-        assert_eq!(ids(col.find("age", FindOp::Eq(Value::Int(30))).unwrap()), vec!["u1", "u2"]);
+        assert_eq!(
+            ids(col.find("age", FindOp::Eq(Value::Int(30))).unwrap()),
+            vec!["u1", "u2"]
+        );
     }
 }
