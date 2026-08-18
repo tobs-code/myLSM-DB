@@ -108,18 +108,33 @@ Beim Start `Database::open`:
 
 Das WAL ist damit der **Durability-Mechanismus**, die SSTables der **persistierte Zustand**. Ein abgeschnittener oder beschädigter Log-Eintrag (typisch bei einem Crash mitten im Schreiben) wird ignoriert — alles davor bleibt gültig.
 
+Seit v0.4 löst `wal::replay` Transaktionen auf: Es wendet nur Transaktionen an, für die ein `Commit`-Record vorhanden ist, und verwirft alle Mutationen von abgebrochenen/abgestürzten Transaktionen. Damit überlebt ein committeter Block einen Crash vollständig, ein uncommitteter nicht.
+
 ---
 
 ## Datenformate
 
 ### WAL-Datensatz (`wal.log`)
 
+Seit v0.4 ist jeder Datensatz typisiert:
+
 ```
-[u32 crc][u8 flags][u32 key_len][u32 val_len][key][value]
+[u32 crc][u8 type][payload]
 ```
 
-- `flags` Bit 0 = gelöscht (dann ist `val_len` = 0).
-- CRC wird über den Body berechnet; `fsync` über `sync()`.
+Die CRC wird über `[type][payload]` berechnet; `fsync` über `sync()`.
+
+| `type` | Bedeutung | Payload |
+|---|---|---|
+| `0` `Put` | Nicht-transaktionales Schreiben | `[u32 key_len][u32 val_len][key][value]` |
+| `1` `Delete` | Nicht-transaktionales Löschen | `[u32 key_len][key]` |
+| `2` `Begin` | Transaktions-Start | `[u64 tx]` |
+| `3` `TxPut` | Transaktions-Schreiben | `[u64 tx][u32 key_len][u32 val_len][key][value]` |
+| `4` `TxDelete` | Transaktions-Löschen | `[u64 tx][u32 key_len][key]` |
+| `5` `Commit` | Transaktions-Commit | `[u64 tx]` |
+| `6` `Abort` | Transaktions-Abbruch | `[u64 tx]` |
+
+**Recovery-Regel:** Eine Transaktion wird genau dann angewandt, wenn ein `Commit`-Record für ihre ID vorhanden ist. `Begin`/`TxPut`/`TxDelete` einer Transaktion ohne `Commit` (abgebrochen oder abgestürzt) werden verworfen. Nicht-transaktionale Records werden unverändert übernommen.
 
 ### SSTable (`NNNNNN.sst`)
 
@@ -166,6 +181,15 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `col.create_index(field)` | v0.3: legt einen geordneten Index auf einem Feld an (auch mit Bestandsdaten). |
 | `col.drop_index(field)` | v0.3: löscht Index-Definition + -Daten. |
 | `col.find(field, FindOp)` | v0.3: Index-Abfrage, liefert verifizierte `Vec<EntityId>`. |
+| `store.transaction()` | v0.4: eröffnet eine Transaktion (exklusiv, solange sie lebt). |
+| `store.transaction_with(f)` | v0.4: führt `f` in einer Transaktion aus (committet bei `Ok`, bricht bei `Err`). |
+| `tx.update(collection, id, &entity)` | v0.4: Entität innerhalb der Transaktion ersetzt/angelegt. |
+| `tx.delete(collection, id)` | v0.4: Entität innerhalb der Transaktion löschen. |
+| `tx.get(collection, id)` | v0.4: liest committete Daten + eigene uncommittete Writes. |
+| `tx.scan_collection(collection)` | v0.4: scannt committete Daten + eigene Writes. |
+| `tx.find(collection, field, FindOp)` | v0.4: Index-Abfrage inkl. eigener uncommitteter Writes. |
+| `tx.commit()` | v0.4: committet atomar (WAL `Begin`→`TxPut`/`TxDelete`→`Commit`, fsync, dann MemTable). |
+| `tx.abort()` | v0.4: verwirft alle uncommitteten Writes (schreibt nichts Persistentes). |
 
 > **Hinweis zu `close()`:** Das ist der primäre Durability-Mechanismus für einen sauberen Shutdown. `drop(db)` ist nur ein **Best-Effort-Fallback** (flusht beim Verwerfen, ignoriert Fehler) — es ist keine Durability-Garantie. Rufe `close()` bewusst auf.
 
@@ -203,11 +227,12 @@ my-lsm-db/
 │   ├── schema.rs     → v0.2/v0.3: persistente Collection-/Field-/Index-Registry
 │   ├── ordering.rs   → v0.3: order-preserving Encoding für Index-Werte
 │   ├── index.rs      → v0.3: Secondary Indexes (create/drop/find/rebuild)
-│   └── entity.rs     → v0.2/v0.3: Entity + EntityStore (put/get/delete, Reconstruction, Index-Maintenance)
+│   └── entity.rs     → v0.2-v0.4: Entity + EntityStore + Transaction (put/get/delete, Reconstruction, Index-Maintenance)
 └── tests/
     ├── engine.rs     → Integrationstests (Flush, Recovery, Compaction, ...)
     ├── entity.rs     → v0.2: Smoke-Tests (put/get, Persistenz über Reopen)
-    └── index.rs      → v0.3: Oracle-Test (find vs Full-Scan)
+    ├── index.rs      → v0.3: Oracle-Test (find vs Full-Scan)
+    └── transaction.rs → v0.4: Random-Modell-Oracle (commit/abort/crash/restart/index/entity)
 ```
 
 ---
@@ -252,14 +277,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo test
 ```
 
-- **10 Unit-Tests** (WAL-Roundtrip/Recovery, MemTable, SSTable-Build/Read, Bloom, Manifest, Merge-Iterator, Compaction)
+- **48 Unit-Tests** (WAL-Roundtrip/Recovery + Transaktions-Replay, MemTable, SSTable-Build/Read, Bloom, Manifest, Merge-Iterator, Compaction, Codec, Schema, Entity + Transactions, Index-Maintenance)
 - **6 Integrationstests** (`tests/engine.rs`): put/get/delete, Range-Scan, Flush + Compaction, WAL-Recovery, Recovery nach Flush+Compaction, Overwrite-Neueste-gewinnt, Tombstone-Verhalten.
+- **2 Crash-Tests** (`tests/crash.rs`): Clean-Close-Persistenz + Crash-Recovery ohne Korruption.
+- **1 Index-Oracle-Test** (`tests/index.rs`): 8000 zufällige Mutationen, `find` vs. Full-Scan identisch.
+- **1 Transaktions-Oracle-Test** (`tests/transaction.rs`): Random-Modell-Tester mischt commit/abort/crash/restart/index/entity und prüft get/scan/find gegen ein In-Memory-Modell.
 
 ---
 
-## Bekannte Einschränkungen (v0.1.1)
+## Bekannte Einschränkungen
 
-- **Einzelprozess, ein Thread** — kein MVCC, keine Sperren, keine Nebenläufigkeit.
+- **Einzelprozess, ein Thread** — kein MVCC, keine Sperren, keine Nebenläufigkeit. Seit v0.4 existiert genau **eine** Transaktion pro Store (`&mut`-Borrow); keine gleichzeitigen Schreiber.
+- **Kein MVCC / keine Snapshot-Isolation** — eine Transaktion sieht committete Daten plus ihre eigenen Writes, aber keine anderen Isolationsstufen.
 - `scan` lädt alle Datensätze in den Speicher (kein Streaming-Iterator über die Platte).
 - Compaction führt nur **einen** Merge-Schritt pro Flush aus (kein mehrstufiges Level-System, keine selektive Compaction).
 - Bloom-Filter sind fest auf `1024` Bit gesetzt, nicht an die Datenmenge angepasst.
@@ -393,6 +422,47 @@ Der `encoded_value` ist **ordnungserhaltend** (`a < b` ⇔ `encode(a) < encode(b
 
 ---
 
+## v0.4 — Atomare Transaktionen
+
+Eine **Einzel-Transaktion** über Entity + Indexe: Alle Mutationen eines `commit()` werden atomar sichtbar — über die Entity **und** die Secondary Indexe. Der WAL ist die Autorität für den Commit-Point.
+
+```rust
+store.transaction_with(|tx| {
+    tx.update("users", "u1", &user)?;   // nur gepuffert
+    tx.update("users", "u2", &other)?;
+    Ok(())                               // → commit()
+})?;
+
+// oder manuell:
+let mut tx = store.transaction()?;
+tx.update("users", "u1", &user)?;
+tx.get("users", "u1")?;                  // sieht den eigenen (uncommitteten) Write
+tx.commit()?;                            // atomar, durable
+```
+
+**Kernprinzipien:**
+
+- **Read-your-own-writes:** `get`/`scan_collection`/`find` überlagern die committete DB mit einem **Pending-Overlay** (`TxMutator`). Lookup-Reihenfolge: *Pending zuerst, dann committed*; bei `scan` gewinnt Pending (inkl. Tombstones).
+- **Nichts persistiert bis `commit()`:** `transaction()` erzeugt nur ein Objekt; `update`/`delete` schreiben in den Pending-Puffer, nicht in den WAL. Ein `abort()`/`drop` ohne Commit hinterlässt **keine** Spur.
+- **Commit-Ablauf (WAL ist der Commit-Point):**
+  ```
+  calculate pending → BEGIN → TxPut/TxDelete… → COMMIT → fsync → MemTable
+  ```
+  Nach dem `fsync` ist der Block dauerhaft; das anschließende MemTable-Apply ist infallibel. Ein Crash vor dem `fsync` verwirft den ganzen Block, einer danach überlebt ihn.
+- **`Mutator`-Abstraktion:** `core_put_entity`/`core_delete_entity`/`find` laufen über `DirectMutator` (committed) oder `TxMutator` (Transaktion) — dieselbe Entity-/Index-Semantik in beiden Pfaden, kein Auseinanderlaufen.
+- **TX-ID-Eindeutigkeit:** `next_tx_id` startet nach `max_seen_tx_id + 1` (aus **allen** WAL-Records, auch uncommitteten), sodass nach einem Crash keine ID wiederverwendet wird.
+
+| Komponente | Test-Ergebnis |
+|---|---|
+| WAL-Typen + tx-aware Replay (committed overlebt, aborted/uncommitted verworfen) | ok |
+| Atomarer Commit (Entity + Index konsistent) | ok |
+| Abort (keine Spur) / `transaction_with` Fehler-Abbruch | ok |
+| Read-your-own-writes (get/scan/find), Write-Sequenz-Matrix | ok |
+| Crash-before-commit (verworfen) / Crash-after-commit (überlebt) | ok |
+| Random-Modell-Oracle (`tests/transaction.rs`, commit/abort/crash/restart) | ok |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -401,7 +471,7 @@ Der `encoded_value` ist **ordnungserhaltend** (`a < b` ⇔ `encode(a) < encode(b
 | **v0.1.1** -fertig- | Härtung: Clean-Shutdown, Benchmark, Crash-Test, `get`-Optimierung (Punkt-Lookup + Caches) |
 | **v0.2** -fertig- | Entity-Layer: Typed Codec, binäres Key-Encoding, persistente Schema-Registry, Entity-Reconstruction |
 | **v0.3** -fertig- | Secondary Indexes: order-preserving Codec, geordneter Value-Index, Index-Maintenance, Index-Rebuild, Oracle-Test |
-| **v0.4** | Transactions (PREPARE/COMMIT über WAL, Index-Konsistenz) |
+| **v0.4** -fertig- | Transactions: atomarer Commit über WAL (BEGIN/COMMIT), Read-your-own-writes, Index-Konsistenz, Random-Modell-Oracle |
 | **v0.5** | Query-Planner / Query-Optimizer |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.
