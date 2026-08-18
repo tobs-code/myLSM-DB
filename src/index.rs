@@ -131,7 +131,7 @@ pub(crate) fn find_m<M: Mutator>(
     upper: &Bound,
 ) -> Result<Vec<String>> {
     if schema.find_index(collection_id, field_id).is_none() {
-        return Err(Error::InvalidFormat("no index on field".into()));
+        return Err(Error::InvalidArgument("no index on field".into()));
     }
     let (start, end) = index_range(collection_id, field_id, lower, upper);
     let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
@@ -142,7 +142,7 @@ pub(crate) fn find_m<M: Mutator>(
     for (key, _) in rows {
         let (_c, _f, entity) = keycodec::decode_index_key(&key)
             .ok_or_else(|| Error::InvalidFormat("bad index key".into()))?;
-        let eid = String::from_utf8_lossy(entity).into_owned();
+        let eid = crate::keycodec::decode_entity_id(entity)?.to_string();
         if !seen.insert(eid.clone()) {
             continue;
         }

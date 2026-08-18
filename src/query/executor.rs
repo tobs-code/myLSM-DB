@@ -196,7 +196,10 @@ impl<'db> Iterator for ScanAssembler<'db> {
                     let Some(name) = self.schema.field_name(self.cid, ef) else {
                         return Some(Err(Error::InvalidFormat(format!("unknown field id {ef}"))));
                     };
-                    let eid = String::from_utf8_lossy(ee).into_owned();
+                    let eid = match crate::keycodec::decode_entity_id(ee) {
+                        Ok(s) => s.to_string(),
+                        Err(e) => return Some(Err(e)),
+                    };
                     let new_entity = {
                         let mut ent = Entity::new();
                         ent.fields.push((name.to_string(), val.clone()));
@@ -257,10 +260,10 @@ fn index_scan(
         return Ok(Vec::new());
     };
     let Some(fid) = schema.lookup_field_id(cid, field) else {
-        return Err(Error::InvalidFormat(format!("unknown field {field}")));
+        return Err(Error::InvalidArgument(format!("unknown field {field}")));
     };
     if schema.find_index(cid, fid).is_none() {
-        return Err(Error::InvalidFormat(format!("no index on field {field}")));
+        return Err(Error::InvalidArgument(format!("no index on field {field}")));
     }
     index::find(db, schema, cid, fid, lower, upper)
 }

@@ -9,8 +9,10 @@ pub enum Error {
     Corrupt(&'static str),
     /// Ein Eintrag existiert nicht.
     NotFound,
-    /// Verzeichnis/Format ist ungültig oder inkompatibel.
+    /// Verzeichnis/Format ist ungültig oder inkompatibel (Korruption/Encoding).
     InvalidFormat(String),
+    /// Argument-/Aufruf-Fehler: falsche Nutzung der API.
+    InvalidArgument(String),
 }
 
 impl std::fmt::Display for Error {
@@ -20,6 +22,7 @@ impl std::fmt::Display for Error {
             Error::Corrupt(what) => write!(f, "corrupt data: {what}"),
             Error::NotFound => write!(f, "not found"),
             Error::InvalidFormat(s) => write!(f, "invalid format: {s}"),
+            Error::InvalidArgument(s) => write!(f, "invalid argument: {s}"),
         }
     }
 }

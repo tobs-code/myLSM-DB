@@ -557,6 +557,24 @@ Technische Härtung des **Lesepfads**: Vorher materialisierte jeder Read (Entity
 
 ---
 
+## v0.5.2 — API-/Semantik-Härtung
+
+Konsolidierung der **öffentlichen Verträge** — keine neuen Features, keine Vereinfachung der v0.5.1-Lazy-Read-Oracles:
+
+- **Entity-ID = strikt UTF-8:** Die ID bleibt `&str`/`String`. Nicht-UTF-8-Bytes werden **beim Schreiben** (`put_entity`/`delete_entity`) als `Error::InvalidArgument` abgelehnt, nie persistiert. Im Speicher gefundene, nicht-UTF-8-IDs (Korruption) liefern über den neuen `keycodec::decode_entity_id`-Helfer `Error::InvalidFormat` — kein `from_utf8_lossy`-Ersatz mehr auf dem ID-Decode-Pfad.
+- **Fehler-Taxonomie:** Neues `Error::InvalidArgument` für Nutzungs-/Aufruf-Fehler (inaktive Transaktion, unbekanntes Feld ohne Index, read-only-View). `InvalidFormat` bleibt **ausschließlich** Persistenz-/Encoding-Korruption (Codec, SSTable, Manifest, Schema-Parse, Keys).
+- **Read-only-Schema-Invariante:** Lese-Operationen (`scan_collection`, `Transaction::get`/`scan_collection`/`find`) mutieren das Schema **nie** mehr — sie nutzen `lookup_collection_id` statt des mutierenden `collection_id()` und persistieren das Schema nicht. Unbekannte Collection ⇒ konsistent leer (`Ok(vec![])` / `Ok(None)`), kein `SCHEMA`-File wird erzeugt.
+
+| Regressionstest (`tests/hardening.rs`) | Ergebnis |
+|---|---|
+| Nicht-UTF-8-ID bei `put_entity`/`delete_entity` ⇒ `InvalidArgument` | ok |
+| Im Speicher korrupte (nicht-UTF-8) ID ⇒ `InvalidFormat` | ok |
+| Lese-Operationen auf unbekannter Collection leer + kein `SCHEMA`-Write | ok |
+| Bestehendes Schema bleibt nach Reads byte-identisch | ok |
+| Persistenz-Korruption bleibt `InvalidFormat` | ok |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -568,6 +586,7 @@ Technische Härtung des **Lesepfads**: Vorher materialisierte jeder Read (Entity
 | **v0.4** -fertig- | Transactions: atomarer Commit über WAL (BEGIN/COMMIT), Read-your-own-writes, Index-Konsistenz, Random-Modell-Oracle |
 | **v0.5** -fertig- | Query-Planner/Optimizer: deklarative Queries, DNF, regelbasierte Indexwahl, Residual-Filter, Explain, Full-Scan-Oracle |
 | **v0.5.1** -fertig- | **Lazy-Read-Pfad:** `scan_stream`/`ScanIter` (Snapshot via exklusivem Borrow), `TableIter`-Seek, Lazy-Merge, Pull-Model-Executor (`Limit` = `take`), kein O(DB)-Materialisieren auf dem Lesepfad |
+| **v0.5.2** -fertig- | **API-/Semantik-Härtung:** strikt-UTF-8-Entity-IDs (Write ⇒ `InvalidArgument`, Korruption ⇒ `InvalidFormat`), `Error::InvalidArgument`-Taxonomie, Read-only-Schema-Invariante (Reads mutieren kein Schema) |
 | **v0.6** | Tx-Queries, Cost-Based Optimizer, Index-Order-Sortierung |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.

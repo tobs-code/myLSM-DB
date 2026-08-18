@@ -7,6 +7,8 @@
 //! [0x45 'E'] [collection_id u32 LE] [entity_id_len u32 LE] [entity_id] [field_id u32 LE]
 //! ```
 
+use crate::error::{Error, Result};
+
 /// Namespace-Tag für Entity-Keys.
 pub const ENTITY_TAG: u8 = b'E'; // 0x45
 
@@ -107,6 +109,14 @@ pub fn decode_entity_key(key: &[u8]) -> Option<(u32, &[u8], u32)> {
     off += entity_len;
     let field_id = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
     Some((collection_id, entity_id, field_id))
+}
+
+/// Striktes Decode einer Entity-ID aus einem gespeicherten Key.
+///
+/// Nicht-UTF-8 ist **Storage-Korruption** → `InvalidFormat` (kein Lossy-Ersatz).
+pub fn decode_entity_id(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("entity id is not valid utf8".into()))
 }
 
 /// Präfix aller Entity-Keys einer Collection.

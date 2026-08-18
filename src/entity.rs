@@ -226,6 +226,10 @@ fn core_put_entity(
     entity_id: &[u8],
     entity: &Entity,
 ) -> Result<()> {
+    // Entity-ID muss valid-UTF-8 sein (API-Contract); rohe, nicht-UTF-8-Bytes
+    // werden abgelehnt, nie persistiert.
+    std::str::from_utf8(entity_id)
+        .map_err(|_| Error::InvalidArgument("entity id is not valid utf8".into()))?;
     // Zuerst alle Feld-IDs vergeben. Persistiert wird vom Caller (Commit bzw.
     // nicht-transaktionaler Pfad), damit eine abgebrochene Transaktion kein
     // Schema schreibt, BEVOR sie committed ist.
@@ -314,6 +318,8 @@ fn core_delete_entity(
     collection_id: u32,
     entity_id: &[u8],
 ) -> Result<()> {
+    std::str::from_utf8(entity_id)
+        .map_err(|_| Error::InvalidArgument("entity id is not valid utf8".into()))?;
     let (start, end) = keycodec::entity_range(collection_id, entity_id);
     let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
         .scan(Some(&start), end.as_deref())?
@@ -412,7 +418,7 @@ pub(crate) fn core_scan_collection(
     let mut out = Vec::with_capacity(map.len());
     for (ee, entity) in map {
         if !entity.fields.is_empty() {
-            out.push((String::from_utf8_lossy(&ee).into_owned(), entity));
+            out.push((keycodec::decode_entity_id(&ee)?.to_string(), entity));
         }
     }
     Ok(out)
@@ -490,8 +496,9 @@ impl EntityStore {
 
     /// Scannt alle Entities einer Collection. (Auch als Oracle für Tests.)
     pub fn scan_collection(&mut self, name: &str) -> Result<Vec<(String, Entity)>> {
-        let collection_id = self.schema.collection_id(name);
-        self.persist_schema()?;
+        let Some(collection_id) = self.schema.lookup_collection_id(name) else {
+            return Ok(Vec::new());
+        };
         let mut m = DirectMutator { db: &mut self.db };
         core_scan_collection(&self.schema, &mut m, collection_id)
     }
@@ -598,7 +605,7 @@ impl EntityStore {
 impl<'a> Transaction<'a> {
     fn check_active(&self) -> Result<()> {
         if self.state != TxState::Active {
-            return Err(Error::InvalidFormat("transaction is not active".into()));
+            return Err(Error::InvalidArgument("transaction is not active".into()));
         }
         Ok(())
     }
@@ -637,7 +644,9 @@ impl<'a> Transaction<'a> {
     /// Liest eine Entität — committed + eigene uncommittete Writes.
     pub fn get(&mut self, collection: &str, entity_id: &str) -> Result<Option<Entity>> {
         self.check_active()?;
-        let collection_id = self.store.schema.collection_id(collection);
+        let Some(collection_id) = self.store.schema.lookup_collection_id(collection) else {
+            return Ok(None);
+        };
         let (start, end) = keycodec::entity_range(collection_id, entity_id.as_bytes());
         let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let mut m = TxMutator {
@@ -658,7 +667,9 @@ impl<'a> Transaction<'a> {
     /// Scannt alle Entities einer Collection — committed + eigene Writes.
     pub fn scan_collection(&mut self, collection: &str) -> Result<Vec<(String, Entity)>> {
         self.check_active()?;
-        let collection_id = self.store.schema.collection_id(collection);
+        let Some(collection_id) = self.store.schema.lookup_collection_id(collection) else {
+            return Ok(Vec::new());
+        };
         let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let mut m = TxMutator {
                 db: &mut self.store.db,
@@ -679,12 +690,14 @@ impl<'a> Transaction<'a> {
     /// Index-Abfrage — committed + eigene uncommittete Index-Writes.
     pub fn find(&mut self, collection: &str, field: &str, op: FindOp) -> Result<Vec<String>> {
         self.check_active()?;
-        let collection_id = self.store.schema.collection_id(collection);
+        let Some(collection_id) = self.store.schema.lookup_collection_id(collection) else {
+            return Ok(Vec::new());
+        };
         let field_id = self
             .store
             .schema
             .lookup_field_id(collection_id, field)
-            .ok_or_else(|| Error::InvalidFormat(format!("unknown field {field}")))?;
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown field {field}")))?;
         let (lower, upper) = op.to_bounds();
         let mut m = TxMutator {
             db: &mut self.store.db,
@@ -782,10 +795,10 @@ impl<'a> Mutator for DirectScan<'a> {
         Ok(Box::new(iter.cloned().map(Ok)))
     }
     fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        Err(Error::InvalidFormat("read-only view".into()))
+        Err(Error::InvalidArgument("read-only view".into()))
     }
     fn delete(&mut self, _key: &[u8]) -> Result<()> {
-        Err(Error::InvalidFormat("read-only view".into()))
+        Err(Error::InvalidArgument("read-only view".into()))
     }
 }
 
@@ -826,7 +839,7 @@ impl<'a> CollectionHandle<'a> {
             .store
             .schema
             .lookup_field_id(self.collection_id, field)
-            .ok_or_else(|| Error::InvalidFormat(format!("unknown field {field}")))?;
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown field {field}")))?;
         let (lower, upper) = op.to_bounds();
         index::find(
             &mut self.store.db,
