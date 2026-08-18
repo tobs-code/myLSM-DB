@@ -83,7 +83,10 @@ impl TableBuilder {
         w.write_all(&self.spacing.to_le_bytes())?;
         w.write_all(&self.num_records.to_le_bytes())?;
         w.write_all(&MAGIC.to_le_bytes())?;
+        // Dauerhaft aufs Medium schreiben, BEVOR ein Manifest-Commit die Datei
+        // referenzieren kann. Nur flush() reicht nicht (Userspace-Puffer).
         w.flush()?;
+        w.get_ref().sync_all()?;
         Ok(self.num_records)
     }
 }
@@ -95,6 +98,10 @@ pub struct TableReader {
     bloom: Option<BloomFilter>,
     /// Einmalig beim Öffnen geparster sparse Index (Key → Block-Offset).
     index_entries: Vec<IndexEntry>,
+    /// Physische Grenze der Record-Daten (= Index-Offset). Kein Record darf
+    /// jemals über diese Grenze hinaus gelesen werden (schützt vor dem
+    /// Hineinlesen in Index/Bloom/Footer).
+    data_end: u64,
 }
 
 struct IndexEntry {
@@ -162,6 +169,7 @@ impl TableReader {
             index_entries: parse_index(&index),
             num_records,
             bloom,
+            data_end: index_offset,
         })
     }
 
@@ -190,6 +198,11 @@ impl TableReader {
     }
 
     fn read_record(&mut self) -> Result<Option<(Vec<u8>, Entry)>> {
+        // Nie über die physische Record-Grenze hinaus lesen (Index/Bloom/Footer
+        // sind keine Records). Schützt lookup() vor Fehlinterpretation.
+        if self.file.stream_position()? >= self.data_end {
+            return Ok(None);
+        }
         let mut len_buf = [0u8; 8];
         match self.file.read_exact(&mut len_buf) {
             Ok(_) => {}
@@ -373,6 +386,26 @@ mod tests {
         assert_eq!(r.lookup(b"b").unwrap(), Some(None));
         // nicht vorhanden → None
         assert_eq!(r.lookup(b"zz").unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_stays_within_record_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sst");
+        let mut b = TableBuilder::new(&path).unwrap();
+        for i in 0..100u32 {
+            let k = format!("key-{:03}", i);
+            b.add(k.as_bytes(), Some(b"v".as_slice())).unwrap();
+        }
+        b.finish().unwrap();
+
+        let mut r = TableReader::open(&path).unwrap();
+        // Key jenseits des Maximalwerts: darf NICHT in Index/Bloom/Footer lesen,
+        // sondern muss sauber Ok(None) liefern (kein UnexpectedEof/InvalidFormat).
+        assert_eq!(r.lookup(b"zzz").unwrap(), None);
+        assert_eq!(r.lookup(b"key-099").unwrap(), Some(Some(b"v".to_vec())));
+        // Bloß zur Sicherheit auch die Grenze im direkten Record-Bereich prüfen.
+        assert_eq!(r.iter().unwrap().len(), 100);
     }
 
     #[test]

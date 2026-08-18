@@ -135,13 +135,12 @@ impl Database {
                 let hit = if let Some(reader) = self.table_cache.get_mut(id) {
                     reader.lookup(key)?
                 } else {
-                    // Nicht gecacht → öffnen, lookuppen und (falls gefunden) cachen.
+                    // Nicht gecacht → öffnen und IMMER cachen (auch ein negativer
+                    // Lookup profitiert vom geparsten Index und geöffneten File).
                     let path = self.table_path(*id);
                     let mut reader = sstable::TableReader::open(&path)?;
                     let result = reader.lookup(key)?;
-                    if result.is_some() {
-                        self.table_cache.insert(*id, reader);
-                    }
+                    self.table_cache.insert(*id, reader);
                     result
                 };
                 // lookup unterscheidet "vorhanden (auch Tombstone)" von "fehlt".
@@ -209,9 +208,10 @@ impl Database {
         let new_id = self.manifest.next_table_id;
         self.manifest.next_table_id += 1;
         let new_path = self.table_path(new_id);
+        // build_table_from_sorted führt bereits ein fsync der neuen SSTable aus.
         compaction::build_table_from_sorted(&new_path, &merged)?;
 
-        // Alte Tabellen aus Manifest + Platte entfernen.
+        // Alte Tabellen aus dem Manifest entfernen + neue aufnehmen.
         let removed: Vec<u64> = self
             .manifest
             .levels
@@ -227,16 +227,22 @@ impl Database {
                     .unwrap_or_default(),
             )
             .collect();
-        for id in &removed {
-            let _ = std::fs::remove_file(self.table_path(*id));
-        }
         if self.manifest.levels.len() <= level + 1 {
             self.manifest.levels.push(Vec::new());
         }
         self.manifest.levels[level] = Vec::new();
         self.manifest.levels[level + 1] = vec![new_id];
+        // Manifest-COMMIT (fsync + atomarer rename) MUSS vor dem Löschen der
+        // alten SSTables passieren. Sonst verweist das Manifest nach einem Crash
+        // auf bereits gelöschte Dateien. Verbleibende alte Dateien sind nach einem
+        // Crash einfach Orphaned Garbage, das später aufgeräumt werden kann.
         self.manifest.save(&self.manifest_path)?;
         self.table_cache.clear(); // alte gelöscht, neue Tabelle entstanden
+
+        // Erst NACH dem Commit die alten SSTable-Dateien von der Platte entfernen.
+        for id in &removed {
+            let _ = std::fs::remove_file(self.table_path(*id));
+        }
         Ok(())
     }
 
