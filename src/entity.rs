@@ -26,7 +26,7 @@ use crate::keycodec;
 use crate::ordering;
 use crate::query::{self, QueryBuilder};
 use crate::schema::{IndexStatus, Schema};
-use crate::{Database, DirectMutator, Mutator};
+use crate::{Database, DirectMutator, Mutator, ScanStream};
 
 /// Eine rekonstruierte Entität: eine (geordnete) Liste benannter getypter Werte.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -122,21 +122,17 @@ impl<'a> Mutator for TxMutator<'a> {
         }
         self.db.get(key)
     }
-    fn scan(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        let committed = self.db.scan(start, end)?;
-        let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = committed.into_iter().collect();
-        for (k, v) in self.pending.iter() {
-            let in_start = start.is_none_or(|s| k.as_slice() >= s);
-            let in_end = end.is_none_or(|e| k.as_slice() < e);
-            if in_start && in_end {
-                map.insert(k.clone(), v.clone());
-            }
-        }
-        Ok(map.into_iter().collect())
+    fn scan<'s>(&'s mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream<'s>> {
+        let committed = self.db.scan_stream(start, end)?;
+        let mut tx = TxScan {
+            committed: Box::new(committed),
+            pending: self.pending.iter(),
+            pending_buf: None,
+            start: start.map(Into::into),
+            end: end.map(Into::into),
+        };
+        tx.load_pending();
+        Ok(Box::new(tx))
     }
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.pending.insert(key.to_vec(), Some(value.to_vec()));
@@ -145,6 +141,61 @@ impl<'a> Mutator for TxMutator<'a> {
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.pending.insert(key.to_vec(), None);
         Ok(())
+    }
+}
+
+/// Lazy 2-Wege-Merge über committed Stream + Pending (in Sortierreihenfolge).
+/// **Pending gewinnt** bei gleichem Key (inkl. Tombstones), der committed
+/// Eintrag wird dann übersprungen (Shadowing).
+struct TxScan<'s> {
+    committed: crate::ScanStream<'s>,
+    pending: std::collections::btree_map::Iter<'s, Vec<u8>, Option<Vec<u8>>>,
+    pending_buf: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+}
+
+impl<'s> TxScan<'s> {
+    fn in_range(&self, k: &[u8]) -> bool {
+        self.start.as_ref().is_none_or(|s| k >= s.as_slice())
+            && self.end.as_ref().is_none_or(|e| k < e.as_slice())
+    }
+    fn load_pending(&mut self) {
+        while self.pending_buf.is_none() {
+            match self.pending.next() {
+                None => break,
+                Some((k, _v)) if !self.in_range(k) => continue,
+                Some((k, v)) => self.pending_buf = Some((k.clone(), v.clone())),
+            }
+        }
+    }
+}
+
+impl<'s> Iterator for TxScan<'s> {
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.load_pending();
+        let committed = match self.committed.next() {
+            None => None,
+            Some(Err(e)) => return Some(Err(e)),
+            Some(Ok(x)) => Some(x),
+        };
+        match (committed, self.pending_buf.clone()) {
+            (None, None) => None,
+            (None, Some(p)) => {
+                self.pending_buf = None;
+                Some(Ok(p))
+            }
+            (Some(c), None) => Some(Ok(c)),
+            (Some(c), Some(p)) => {
+                if p.0 <= c.0 {
+                    self.pending_buf = None;
+                    Some(Ok(p))
+                } else {
+                    Some(Ok(c))
+                }
+            }
+        }
     }
 }
 
@@ -186,7 +237,9 @@ fn core_put_entity(
 
     // Bisherige Felder der Entität ermitteln (für Stale-Removal + Index-Diff).
     let (start, end) = keycodec::entity_range(collection_id, entity_id);
-    let existing = m.scan(Some(&start), end.as_deref())?;
+    let existing: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
     let mut old_values: HashMap<u32, Value> = HashMap::new();
     for (key, value_opt) in &existing {
         if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
@@ -262,7 +315,9 @@ fn core_delete_entity(
     entity_id: &[u8],
 ) -> Result<()> {
     let (start, end) = keycodec::entity_range(collection_id, entity_id);
-    let rows = m.scan(Some(&start), end.as_deref())?;
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
     // Erst die Feldwerte einsammeln (für die Index-Bereinigung) und die
     // Entity-Keys löschen; danach die Index-Einträge entfernen.
     let indexed = indexed_field_ids(schema, collection_id);
@@ -299,7 +354,9 @@ pub(crate) fn core_get_entity(
     entity_id: &[u8],
 ) -> Result<Option<Entity>> {
     let (start, end) = keycodec::entity_range(collection_id, entity_id);
-    let rows = m.scan(Some(&start), end.as_deref())?;
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -332,7 +389,9 @@ pub(crate) fn core_scan_collection(
 ) -> Result<Vec<(String, Entity)>> {
     let pstart = keycodec::collection_prefix(collection_id);
     let pend = keycodec::successor(&pstart);
-    let rows = m.scan(Some(&pstart), pend.as_deref())?;
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&pstart), pend.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
     let mut map: BTreeMap<Vec<u8>, Entity> = Default::default();
     for (key, value_opt) in rows {
         let Some((_, ee, ef)) = keycodec::decode_entity_key(&key) else {
@@ -580,12 +639,13 @@ impl<'a> Transaction<'a> {
         self.check_active()?;
         let collection_id = self.store.schema.collection_id(collection);
         let (start, end) = keycodec::entity_range(collection_id, entity_id.as_bytes());
-        let rows = {
+        let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let mut m = TxMutator {
                 db: &mut self.store.db,
                 pending: &mut self.pending,
             };
             m.scan(Some(&start), end.as_deref())?
+                .collect::<std::result::Result<_, _>>()?
         };
         core_get_entity(
             &self.store.schema,
@@ -599,7 +659,7 @@ impl<'a> Transaction<'a> {
     pub fn scan_collection(&mut self, collection: &str) -> Result<Vec<(String, Entity)>> {
         self.check_active()?;
         let collection_id = self.store.schema.collection_id(collection);
-        let rows = {
+        let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let mut m = TxMutator {
                 db: &mut self.store.db,
                 pending: &mut self.pending,
@@ -607,6 +667,7 @@ impl<'a> Transaction<'a> {
             let pstart = keycodec::collection_prefix(collection_id);
             let pend = keycodec::successor(&pstart);
             m.scan(Some(&pstart), pend.as_deref())?
+                .collect::<std::result::Result<_, _>>()?
         };
         core_scan_collection(
             &self.store.schema,
@@ -709,21 +770,16 @@ impl<'a> Mutator for DirectScan<'a> {
             .find(|(k, _)| k.as_slice() == key)
             .and_then(|(_, v)| v.clone()))
     }
-    fn scan(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        Ok(self
-            .rows
-            .iter()
-            .filter(|(k, _)| {
-                let in_start = start.is_none_or(|s| k.as_slice() >= s);
-                let in_end = end.is_none_or(|e| k.as_slice() < e);
-                in_start && in_end
-            })
-            .cloned()
-            .collect())
+    fn scan<'s>(&'s mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream<'s>> {
+        let rows = self.rows;
+        let start = start.map(|s| s.to_vec());
+        let end = end.map(|e| e.to_vec());
+        let iter = rows.iter().filter(move |(k, _)| {
+            let in_start = start.as_ref().is_none_or(|s| k.as_slice() >= s.as_slice());
+            let in_end = end.as_ref().is_none_or(|e| k.as_slice() < e.as_slice());
+            in_start && in_end
+        });
+        Ok(Box::new(iter.cloned().map(Ok)))
     }
     fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
         Err(Error::InvalidFormat("read-only view".into()))

@@ -86,7 +86,9 @@ db.put(key, value)
 1. **MemTable** (neueste Quelle) — autoritativ, wird zuerst geprüft.
 2. **Level 0**, **Level 1**, … (älter) — per `TableReader::get` (mit Bloom-Filter) bzw. Merge-Iterator.
 
-Für `scan` werden alle Quellen über einen `MergedIter` zusammengeführt. Bei gleichen Keys gewinnt die **kleinere Quell-Index-Nummer** (frischer).
+Für `scan` werden alle Quellen über einen Merge-Iterator zusammengeführt. Bei gleichen Keys gewinnt die **kleinere Quell-Index-Nummer** (frischer).
+
+Seit **v0.5.1** ist der Lesepfad **lazy**: `scan_stream` materialisiert die Datenmenge nicht, sondern hält nur einen Cursor pro Quelle (MemTable-Kopie + je einen `TableIter` pro SSTable, positioniert per Sparse-Index). Ein `ScanIter` besitzt **exklusiv** `&mut Database` für seine Lebensdauer, wodurch `put`/`delete`/`flush`/`compact` während der Iteration unmöglich sind und die konsistente Snapshot-Sicht durch Borrowing garantiert ist. `scan` ist ein Komfort-Wrapper, der den Stream einsammelt. Dieselben Quellen werden auch im Entity-/Query-Layer gestreamt: `Limit` hört nach `n` Zeilen auf zu ziehen, `Sort` blockiert (muss alles konsumieren).
 
 ---
 
@@ -167,7 +169,8 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `db.put(key, value)` | Setzt einen Wert. |
 | `db.delete(key)` | Löscht einen Key (Tombstone). |
 | `db.get(key)` | Liefert `Option<Vec<u8>>` (`None` = nicht vorhanden oder gelöscht). |
-| `db.scan(start, end)` | Sortierter Bereichs-Scan, liefert `Vec<(Vec<u8>, Option<Vec<u8>>)>`. |
+| `db.scan(start, end)` | Sortierter Bereichs-Scan, liefert `Vec<(Vec<u8>, Option<Vec<u8>>)>` (Komfort-Wrapper). |
+| `db.scan_stream(start, end)` | v0.5.1: **lazy** Bereichs-Scan, liefert einen `Iterator<Item=Result<...>>` (materialisiert nichts). |
 | `db.flush()` | Erzwingt das Flushen der MemTable als SSTable. |
 | `db.close()` | **Sauber schließen:** MemTable flushen, WAL + Manifest synchen. |
 | `db.table_count()` | Anzahl bekannter SSTables. |
@@ -534,6 +537,26 @@ Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` w
 
 ---
 
+## v0.5.1 — Lazy-Read-Pfad
+
+Technische Härtung des **Lesepfads**: Vorher materialisierte jeder Read (Entity-Lookup, Collection-Scan, Query ohne Sort, sogar das veraltete Feld-Lesen beim Update) die **gesamte Datenmenge** der Engine (`read_snapshot` → `merge_level` → `TableReader::iter`), also O(ganze DB). Seit v0.5.1 ist das Lesen **lazy** und O(gesuchter Bereich):
+
+- **`Database::scan_stream(start, end)`** liefert einen `ScanIter` (statt `Vec`). Es hält je Quelle **einen** Cursor: eine beschränkte MemTable-Kopie + pro SSTable einen `TableIter`, der sich per Sparse-Index exakt auf den Block mit `start` positioniert und nur die Records des Ranges liest.
+- **Snapshot-Konsistenz ohne Lock:** `ScanIter` besitzt **exklusiv `&mut Database`** für seine Lebensdauer (Borrowing). Damit sind `put`/`delete`/`flush`/`compact` während der Iteration unmöglich und der beim Erzeugen festgelegte SSTable-Satz bleibt stabil. Bewusst **kein** Public-`Snapshot`-Struct (Variante B/MVCC ist später als Drop-in denkbar).
+- **`MergeIter`** (binärer Heap, O(#Quellen)-Speicher, nie O(#Records)): neueste Quelle gewinnt, ältere Quellen desselben Keys werden vollständig überschattet, Tombstones sind reguläre Werte und verdecken ältere Werte. Derselbe Mechanismus dient auch der Compaction (`merge_vecs`).
+- **`Mutator::scan` (Breaking Change)** gibt nun einen lazy `ScanStream` zurück statt `Vec`; `TxMutator` baut daraus einen lazy 2-Wege-Merge (committed ∘ pending, pending gewinnt). Die Entity-Kernfunktionen sammeln ihre schmalen Entity-Ranges weiterhin ein — Logik unverändert.
+- **Executor-Pull-Model:** `FullScan` streamt Entities aus `scan_stream`, `Fetch` point-fetcht je Kandidaten-ID, `Limit` = `take(n)` (hört auf zu ziehen), nur `Sort` blockiert. `UnionIds` merge eager (ein `&mut db`) mit Dedup per ID.
+
+| Komponente | Test-Ergebnis |
+|---|---|
+| `TableIter` (Seek exakt `>= start`, Blockgrenzen, `end` exklusiv) | ok |
+| `MergeIter` (newest-wins, Tombstone-Shadowing, leere Quellen) | ok |
+| Lazy-vs-Eager Equivalence (MemTable + mehrere SSTables, Überschattungen, Range-Grenzen, leere/nicht vorhandene Ranges) | ok |
+| `Mutator`-Migration (Direct + Tx, DirectScan) | ok |
+| Bestehende Index-/Transaction-/Query-Oracles | ok (unverändert grün) |
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -544,6 +567,7 @@ Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` w
 | **v0.3** -fertig- | Secondary Indexes: order-preserving Codec, geordneter Value-Index, Index-Maintenance, Index-Rebuild, Oracle-Test |
 | **v0.4** -fertig- | Transactions: atomarer Commit über WAL (BEGIN/COMMIT), Read-your-own-writes, Index-Konsistenz, Random-Modell-Oracle |
 | **v0.5** -fertig- | Query-Planner/Optimizer: deklarative Queries, DNF, regelbasierte Indexwahl, Residual-Filter, Explain, Full-Scan-Oracle |
+| **v0.5.1** -fertig- | **Lazy-Read-Pfad:** `scan_stream`/`ScanIter` (Snapshot via exklusivem Borrow), `TableIter`-Seek, Lazy-Merge, Pull-Model-Executor (`Limit` = `take`), kein O(DB)-Materialisieren auf dem Lesepfad |
 | **v0.6** | Tx-Queries, Cost-Based Optimizer, Index-Order-Sortierung |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.

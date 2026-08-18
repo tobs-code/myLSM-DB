@@ -134,7 +134,9 @@ pub(crate) fn find_m<M: Mutator>(
         return Err(Error::InvalidFormat("no index on field".into()));
     }
     let (start, end) = index_range(collection_id, field_id, lower, upper);
-    let rows = m.scan(Some(&start), end.as_deref())?;
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
     let mut ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for (key, _) in rows {

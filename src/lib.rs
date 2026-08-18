@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use error::Result;
-use iterator::{MergedIter, ReadSnapshot};
+use iterator::{MergeIter, ScanIter, ScanSource, memtable_source, merge_vecs};
 use manifest::Manifest;
 use memtable::{Entry, MemTable};
 use wal::Wal;
@@ -218,22 +218,38 @@ impl Database {
         Ok(None)
     }
 
-    /// Bereichs-Scan [start, end). Liefert sortierte (key, Option<value>).
+    /// Bereichs-Scan `[start, end)`. Lazy — materialisiert **nicht** die
+    /// Datenmenge, sondern liefert einen Stream über MemTable-Kopie + gecachten
+    /// SSTable-Cursorn.
+    pub fn scan_stream<'a>(
+        &'a mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<ScanIter<'a>> {
+        let mut sources: Vec<Box<dyn ScanSource>> = Vec::new();
+        // MemTable ist die neueste Quelle (Index 0). Kopie ist beschränkt
+        // (≤ memtable_limit) und über den exklusiven Borrow konsistent.
+        sources.push(Box::new(memtable_source(&self.memtable, start, end)));
+        for level in &self.manifest.levels {
+            for id in level.iter().rev() {
+                let path = self.table_path(*id);
+                let table = sstable::TableIter::open(&path, start, end)?;
+                sources.push(Box::new(table));
+            }
+        }
+        let merge = MergeIter::new(sources);
+        Ok(ScanIter::new(self, merge))
+    }
+
+    /// Bereichs-Scan `[start, end)`. Liefert sortierte `(key, Option<value>)`.
+    /// Komfort-Wrapper: sammelt [`scan_stream`](Self::scan_stream) ein.
     pub fn scan(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        let snapshot = self.read_snapshot()?;
-        let merged: Vec<_> = snapshot.merge().collect();
-        Ok(merged
-            .into_iter()
-            .filter(|(k, _)| {
-                let in_start = start.map_or(true, |s| k.as_slice() >= s);
-                let in_end = end.map_or(true, |e| k.as_slice() < e);
-                in_start && in_end
-            })
-            .collect())
+        self.scan_stream(start, end)?
+            .collect::<std::result::Result<Vec<_>, _>>()
     }
 
     /// Erzwingt das Flushen der aktuellen MemTable als SSTable (Level 0).
@@ -275,8 +291,7 @@ impl Database {
         let level_records = self.merge_level(level);
         let next_records = self.merge_level(level + 1);
 
-        let merged: Vec<(Vec<u8>, Entry)> =
-            MergedIter::new(vec![level_records, next_records]).collect();
+        let merged = merge_vecs(vec![level_records, next_records])?;
 
         // Neuen Schlüssel vergeben.
         let new_id = self.manifest.next_table_id;
@@ -335,20 +350,7 @@ impl Database {
                 }
             }
         }
-        MergedIter::new(sources).collect()
-    }
-
-    fn read_snapshot(&mut self) -> Result<ReadSnapshot> {
-        let mut snapshot = ReadSnapshot::empty();
-        snapshot.memtable = self
-            .memtable
-            .iter()
-            .map(|(k, v)| (k.to_vec(), v.clone()))
-            .collect();
-        for level in 0..self.manifest.levels.len() {
-            snapshot.levels.push(self.merge_level(level));
-        }
-        Ok(snapshot)
+        merge_vecs(sources).unwrap_or_default()
     }
 
     fn table_path(&self, id: u64) -> PathBuf {
@@ -403,17 +405,17 @@ impl Drop for Database {
 pub trait Mutator {
     /// Punkt-Lookup. `None` = nicht vorhanden oder gelöscht.
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    /// Bereichs-Scan `[start, end)`, sortiert.
-    fn scan(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>>;
+    /// Bereichs-Scan `[start, end)`, sortiert, **lazy** (streamt die Quellen,
+    /// materialisiert nicht die Datenmenge).
+    fn scan<'s>(&'s mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream<'s>>;
     /// Schreibt (bzw. überschreibt) einen Key.
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
     /// Löscht einen Key (Tombstone).
     fn delete(&mut self, key: &[u8]) -> Result<()>;
 }
+
+/// Sortierter, lazy Scan-Stream über eine Mutator-Sicht.
+pub type ScanStream<'s> = Box<dyn Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>> + 's>;
 
 /// Mutator direkt auf der committeten Engine (nicht-transaktionaler Pfad).
 pub struct DirectMutator<'a> {
@@ -424,17 +426,104 @@ impl<'a> Mutator for DirectMutator<'a> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.db.get(key)
     }
-    fn scan(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        self.db.scan(start, end)
+    fn scan<'s>(&'s mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream<'s>> {
+        Ok(Box::new(self.db.scan_stream(start, end)?))
     }
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.db.put(key, value)
     }
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.db.delete(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Eager-Referenz: newest-wins-Merge über MemTable + alle Tabellen
+    /// (gleiche Quellen-Reihenfolge wie `scan_stream`).
+    fn model_scan(
+        db: &Database,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let in_range = |k: &[u8]| start.is_none_or(|s| k >= s) && end.is_none_or(|e| k < e);
+        let mut order: Vec<Vec<(Vec<u8>, Option<Vec<u8>>)>> = Vec::new();
+        order.push(
+            db.memtable
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.clone()))
+                .collect(),
+        );
+        for level in &db.manifest.levels {
+            for id in level.iter().rev() {
+                if let Ok(mut r) = sstable::TableReader::open(&db.table_path(*id)) {
+                    if let Ok(recs) = r.iter() {
+                        order.push(recs);
+                    }
+                }
+            }
+        }
+        // order[0] ist die neueste Quelle → erster Insert pro Key gewinnt.
+        let mut best: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for src in order {
+            for (k, v) in src {
+                if in_range(&k) {
+                    best.entry(k).or_insert(v);
+                }
+            }
+        }
+        best.into_iter().collect()
+    }
+
+    fn setup(dir: &Path) -> Database {
+        let mut db = Database::open(dir).unwrap();
+        db.put(b"a", b"new").unwrap();
+        db.put(b"b", b"tomb-mem").unwrap();
+        db.put(b"c", b"1").unwrap();
+        db.flush().unwrap(); // Tabelle 1
+        db.delete(b"b").unwrap(); // Tombstone in MemTable schattiert altes b
+        db.put(b"d", b"2").unwrap();
+        db.put(b"z", b"znew").unwrap();
+        db.flush().unwrap(); // Tabelle 2
+        db.put(b"a", b"newer").unwrap();
+        db.delete(b"c").unwrap();
+        db.put(b"e", b"5").unwrap();
+        db.put(b"\x00", b"low").unwrap();
+        db
+    }
+
+    #[test]
+    fn lazy_equals_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let ranges: Vec<(Option<&[u8]>, Option<&[u8]>)> = vec![
+            (None, None),
+            (Some(b"b"), None),
+            (None, Some(b"d")),
+            (Some(b"a"), Some(b"z")),
+            (Some(b"cc"), Some(b"dd")), // mitten im Block / leere Mitte
+            (Some(b"\xff"), None),      // größer als alle vorhandenen
+            (Some(b""), Some(b"\x00")), // end == start → leer
+        ];
+        for (s, e) in ranges {
+            let expected = model_scan(&db, s, e);
+            let actual = db.scan(s, e).unwrap();
+            assert_eq!(actual, expected, "range {s:?}..{e:?}");
+        }
+    }
+
+    #[test]
+    fn lazy_streams_consistently_under_borrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let mut stream = db.scan_stream(None, None).unwrap();
+        let first = stream.next().unwrap().unwrap();
+        // Der exklusive Borrow ist aktiv: weitere &mut-Zugriffe sind unmöglich.
+        assert_eq!(first.0, b"\x00".to_vec());
+        let rest: std::result::Result<Vec<_>, _> = stream.collect();
+        assert!(!rest.unwrap().is_empty());
     }
 }

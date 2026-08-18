@@ -276,6 +276,77 @@ impl TableReader {
     }
 }
 
+/// Lazy Iterator über eine SSTable im Range `[start, end)`.
+///
+/// `start` inklusiv, `end` exklusiv. Der Iterator positioniert sich per
+/// sparse Index auf den Block, in dem `start` liegen würde, und liest dann nur
+/// die Records des Ranges — **keine** vollständige Materialisierung.
+pub struct TableIter {
+    reader: TableReader,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    /// `None` = noch nicht geladen; `Some(None)` = erschöpft; `Some(Some(..))` = gepuffert.
+    cur: Option<Option<(Vec<u8>, Entry)>>,
+}
+
+impl TableIter {
+    pub fn open(path: &Path, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<TableIter> {
+        let mut reader = TableReader::open(path)?;
+        // Positioniere auf den Block, der `start` enthalten würde.
+        let offset = match start {
+            Some(s) => reader.block_offset_for(&reader.index_entries, s),
+            None => reader.index_entries.first().map_or(0, |e| e.offset),
+        };
+        reader.file.seek(SeekFrom::Start(offset))?;
+        Ok(TableIter {
+            reader,
+            start: start.map(Into::into),
+            end: end.map(Into::into),
+            cur: None,
+        })
+    }
+
+    /// Lädt den nächsten Record in `cur`, respektiert `[start, end)`.
+    fn load(&mut self) -> Result<()> {
+        loop {
+            match self.reader.read_record()? {
+                None => {
+                    self.cur = Some(None);
+                    return Ok(());
+                }
+                Some((k, v)) => {
+                    if let Some(e) = &self.end {
+                        if k.as_slice() >= e.as_slice() {
+                            self.cur = Some(None);
+                            return Ok(());
+                        }
+                    }
+                    if let Some(s) = &self.start {
+                        if k.as_slice() < s.as_slice() {
+                            continue; // unterhalb des Ranges überspringen
+                        }
+                    }
+                    self.cur = Some(Some((k, v)));
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+impl crate::iterator::ScanSource for TableIter {
+    fn peek(&mut self) -> Result<Option<(Vec<u8>, Entry)>> {
+        if self.cur.is_none() {
+            self.load()?;
+        }
+        Ok(self.cur.clone().unwrap())
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.cur = None;
+        Ok(())
+    }
+}
+
 /// Einfacher Bloom-Filter mit doppeltem Hashing (FNV-1a).
 pub struct BloomFilter {
     bits: Vec<u8>,
@@ -349,6 +420,7 @@ impl BloomFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iterator::ScanSource;
 
     #[test]
     fn build_and_read() {
@@ -407,6 +479,60 @@ mod tests {
         assert_eq!(r.lookup(b"key-099").unwrap(), Some(Some(b"v".to_vec())));
         // Bloß zur Sicherheit auch die Grenze im direkten Record-Bereich prüfen.
         assert_eq!(r.iter().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn table_iter_seeks_and_stops_at_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sst");
+        let mut b = TableBuilder::new(&path).unwrap();
+        for i in 0..100u32 {
+            let k = format!("key-{:03}", i);
+            b.add(k.as_bytes(), Some(b"v".as_slice())).unwrap();
+        }
+        b.finish().unwrap();
+
+        // Vollständiger Scan: alle 100, sortiert.
+        let mut it = TableIter::open(&path, None, None).unwrap();
+        let all = drain_table(&mut it);
+        assert_eq!(all.len(), 100);
+        assert_eq!(all[0], b"key-000".to_vec());
+
+        // Seek exakt am ersten >= start, mitten im 2. Block.
+        let mut it = TableIter::open(&path, Some(b"key-017"), Some(b"key-050")).unwrap();
+        let r = drain_table(&mut it);
+        let expected: Vec<Vec<u8>> = (17..50)
+            .map(|i| format!("key-{:03}", i).into_bytes())
+            .collect();
+        assert_eq!(r, expected);
+
+        // start exakt an einer Blockgrenze (Record 16 beginnt Block 2).
+        let mut it = TableIter::open(&path, Some(b"key-016"), Some(b"key-032")).unwrap();
+        let r = drain_table(&mut it);
+        let expected: Vec<Vec<u8>> = (16..32)
+            .map(|i| format!("key-{:03}", i).into_bytes())
+            .collect();
+        assert_eq!(r, expected);
+
+        // start jenseits des Maximalwerts bzw. end vor dem Minimalwert → leer.
+        let mut it = TableIter::open(&path, Some(b"key-999"), None).unwrap();
+        assert!(drain_table(&mut it).is_empty());
+        let mut it = TableIter::open(&path, None, Some(b"key-000")).unwrap();
+        assert!(drain_table(&mut it).is_empty());
+    }
+
+    fn drain_table(it: &mut TableIter) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            match it.peek().unwrap() {
+                None => break,
+                Some((k, _)) => {
+                    out.push(k);
+                    it.advance().unwrap();
+                }
+            }
+        }
+        out
     }
 
     #[test]
