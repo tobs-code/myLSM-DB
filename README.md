@@ -538,26 +538,6 @@ Hier wählt der Planner den Index auf `age` für `age >= 30`; `country = "DE"` w
 
 ---
 
-## v0.6 — Query-Ausführung, Cost-Based Indexwahl, Index-Order / Top-K
-
-v0.6 erweitert die Query-Schicht, ohne die Storage-Architektur umzubauen:
-
-- **Transaktionale Queries:** Der Executor läuft über `Mutator`, sodass `get`, `scan_collection`, `find` und Query-Ausführung dieselben Pending-Writes sehen.
-- **Cost-Based Indexwahl:** Der Planner wählt pro DNF-Klausel deterministisch den günstigsten READY-Index über ein kleines Kostenmodell (`Eq < Between < OneSided`), ohne Statistik-Infrastruktur.
-- **Index-Order / Top-K:** Wenn das Sortierfeld in **jeder** DNF-Klausel positiv vorhanden ist und ein READY-Index existiert, wird `ORDER BY indexed_field LIMIT n` als `Limit { Filter { IndexOrderScan } }` geplant. Sonst bleibt der bestehende `Sort`-Fallback unverändert blockierend.
-
-Wichtig ist die Invariante: Presence-Garantie schaltet den geordneten Pfad erst frei. Die Entity-Verifikation bleibt trotzdem Pflicht, damit Index-/Entity-Abweichungen nie sichtbar werden.
-
-**`explain()`-Beispiel mit v0.6-Pfad:**
-
-```text
-Limit { n: 5 }
-  Filter { predicate: age >= 0 }
-    IndexOrderScan { collection: users, field: age, range: [0,]..∅, dir: Asc }
-```
-
----
-
 ## v0.5.1 — Lazy-Read-Pfad
 
 Technische Härtung des **Lesepfads**: Vorher materialisierte jeder Read (Entity-Lookup, Collection-Scan, Query ohne Sort, sogar das veraltete Feld-Lesen beim Update) die **gesamte Datenmenge** der Engine (`read_snapshot` → `merge_level` → `TableReader::iter`), also O(ganze DB). Seit v0.5.1 ist das Lesen **lazy** und O(gesuchter Bereich):
@@ -596,6 +576,75 @@ Konsolidierung der **öffentlichen Verträge** — keine neuen Features, keine V
 
 ---
 
+## v0.6 — Query-Ausführung, Cost-Based Indexwahl, Index-Order / Top-K
+
+v0.6 erweitert die Query-Schicht, ohne die Storage-Architektur umzubauen:
+
+- **Transaktionale Queries:** Der Executor läuft über `Mutator`, sodass `get`, `scan_collection`, `find` und Query-Ausführung dieselben Pending-Writes sehen.
+- **Cost-Based Indexwahl:** Der Planner wählt pro DNF-Klausel deterministisch den günstigsten READY-Index über ein kleines Kostenmodell (`Eq < Between < OneSided`), ohne Statistik-Infrastruktur.
+- **Index-Order / Top-K:** Wenn das Sortierfeld in **jeder** DNF-Klausel positiv vorhanden ist und ein READY-Index existiert, wird `ORDER BY indexed_field LIMIT n` als `Limit { Filter { IndexOrderScan } }` geplant. Sonst bleibt der bestehende `Sort`-Fallback unverändert blockierend.
+
+Wichtig ist die Invariante: Presence-Garantie schaltet den geordneten Pfad erst frei. Die Entity-Verifikation bleibt trotzdem Pflicht, damit Index-/Entity-Abweichungen nie sichtbar werden.
+
+**`explain()`-Beispiel mit v0.6-Pfad:**
+
+```text
+Limit { n: 5 }
+  Filter { predicate: age >= 0 }
+    IndexOrderScan { collection: users, field: age, range: [0,]..∅, dir: Asc }
+```
+
+---
+
+## v0.7 — Lazy-Read-Komplexitäts-Härtung (Write-/Setup-Engpass)
+
+v0.7 ist **kein Feature-Schritt**, sondern die Behebung zweier **O(N²)-Bugs im Lazy-Read-Pfad**, die jeden Entity-Aufbau (und jeden Write mit vorgeschaltetem Scan) quadratisch machten. Beide Fixes sind als eigenständige Commits abgegrenzt, um ihre Einzeleffekte nachvollziehbar zu halten.
+
+Der Auslöser war ein Benchmark-Befund: Der Setup einer indexierten 10k-Collection brauchte **62–68 s**, obwohl die eigentlichen Messungen (`get`, `scan`) schnell waren. Eine Isolation (`setup-diag`) zeigte, dass schon **ohne** Index 10k Writes ~40 s dauerten — das war kein Index-Problem, sondern der allgemeine Write-/Scan-Pfad.
+
+### v0.7.1 — `memtable_source` materialisiert nur den Range (`O(R)` statt `O(N)`)
+
+`memtable_source` erzeugte bei **jedem** Scan eine Vektor-Kopie der **gesamten** MemTable (alle Key/Value-Clones), egal wie klein der angefragte Bereich war. Da `core_put_entity` vor jedem Put einen schmalen Range-Scan ausführt, wurde jeder Put `O(MemTable)` und der Gesamtaufbau quadratisch.
+
+**Fix:** Statt `memtable.iter().collect()` wird der angefragte Bereich via lazy `BTreeMap::range(start, end)` materialisiert. Ein Guard liefert für leere Intervalle (`start >= end`) eine leere Quelle, statt an `BTreeMap::range` zu gehen (das dort panickt).
+
+| Regressionstest (`src/iterator.rs`) | Ergebnis |
+|---|---|
+| Nur der angefragte Range wird materialisiert | ok |
+| Empty-Range (`start >= end`) ⇒ leere Quelle, kein Panic | ok |
+| Unbounded ⇒ alle Einträge (unverändert) | ok |
+
+### v0.7.2 — `scan_stream` nutzt den `table_cache` (`O(Tabellen)` nur einmal)
+
+`scan_stream` öffnete bei jedem Scan für jede SSTable eine **neue Datei** und reparte Footer/Index/Bloom erneut. Sobald mehrere SSTables existieren (durch MemTable-Flushes), wurde jeder Scan `O(Tabellen)` und das Setup über viele Puts wieder quadratisch.
+
+**Fix:** Der vorhandene `table_cache` (den der `get`-Pfad schon nutzte) wird wiederverwendet. `TableReader` teilt Datei-Handle, sparse Index und Bloom per `Arc`; ein neues `fork()` erzeugt einen billigen Klon mit eigenem Lesepuffer (kein erneuter Datei-/Index-Read). `TableIter::from_reader` baut daraus ohne Neu-Öffnen einen Iterator.
+
+| Regressionstest (`src/lib.rs`) | Ergebnis |
+|---|---|
+| Nach dem 1. Scan ist der Cache mit **allen** Tabellen befüllt | ok |
+| Folge-Scans lassen die Cache-Größe nicht mehr wachsen | ok |
+| Scan-Ergebnis bleibt über wiederholte Scans stabil | ok |
+
+### Eingefrorene Post-Fix-Baseline (100k Entities)
+
+| Workload | Wert | Bemerkung |
+|---|---|---|
+| `get` | **1.28 M reads/s** | skaliert gesund (kein Kollaps) |
+| `scan` (full) | **29.5 MB/s** | konstant über 10k/50k/100k |
+| `index-eq` | **21.4 k lookups/s** | kaum Degradation |
+| `index-range` | **54.3 k lookups/s** | 49010 Hits, validiert |
+| `top-k` | **10.4 k rows/s** | 10 Rows, korrekt |
+| setup (mit Index) | **5.86 s** | zuvor 62–68 s bei nur 10k |
+| recovery | 0.27 s | unkritisch |
+| flush | 0.07 s | unkritisch |
+
+Hinweis: Messungen mit <20 ms Messzeit (z. B. 13 ms bei kleinen Ranges) gelten als Rauschen und werden **nicht** für Performance-Vergleiche herangezogen.
+
+Der Kern des Storage-Read-Pfads ist nach den Fixes bei 100k gesund: kein Grund, blind Reader-Cache, Bloom oder Compaction umzubauen. Die verbleibende Auffälligkeit (Setup-Kurve 10k 0.11 s → 50k 1.48 s → 100k 5.86 s) ist Gegenstand weiterer Instrumentierung, bevor ein dritter Hebel gewählt wird.
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -609,5 +658,7 @@ Konsolidierung der **öffentlichen Verträge** — keine neuen Features, keine V
 | **v0.5.1** -fertig- | **Lazy-Read-Pfad:** `scan_stream`/`ScanIter` (Snapshot via exklusivem Borrow), `TableIter`-Seek, Lazy-Merge, Pull-Model-Executor (`Limit` = `take`), kein O(DB)-Materialisieren auf dem Lesepfad |
 | **v0.5.2** -fertig- | **API-/Semantik-Härtung:** strikt-UTF-8-Entity-IDs (Write ⇒ `InvalidArgument`, Korruption ⇒ `InvalidFormat`), `Error::InvalidArgument`-Taxonomie, Read-only-Schema-Invariante (Reads mutieren kein Schema) |
 | **v0.6** -fertig- | Query-Ausführung, Tx-Queries, Cost-Based Indexwahl, Index-Order / Top-K |
+| **v0.7.1** -fertig- | **Lazy-Read-Komplexität:** `memtable_source` materialisiert nur den angefragten Range (`BTreeMap::range`), Empty-Range-Guard — behebt O(N²) beim Entity-Aufbau |
+| **v0.7.2** -fertig- | **Lazy-Read-Komplexität:** `scan_stream` nutzt den `table_cache`, `TableReader::fork()`/`Arc`-Reader-Sharing — behebt O(N²) bei vielen SSTables |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.
