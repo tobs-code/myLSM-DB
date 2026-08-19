@@ -38,6 +38,7 @@ fn flush_persists_and_compacts() {
     let opts = Options {
         memtable_limit: 256, // winzige MemTable → früher Flush
         l0_compact_threshold: 3,
+        ..Options::default()
     };
     let mut db = Database::open_with(dir.path(), opts).unwrap();
     for i in 0..50u32 {
@@ -82,6 +83,7 @@ fn recovery_after_flush_and_compaction() {
     let opts = Options {
         memtable_limit: 128,
         l0_compact_threshold: 2,
+        ..Options::default()
     };
     {
         let mut db = Database::open_with(dir.path(), opts.clone()).unwrap();
@@ -110,6 +112,7 @@ fn overwrite_newest_wins() {
     let opts = Options {
         memtable_limit: 64, // erzwingt Flush zwischen den Writes
         l0_compact_threshold: 3,
+        ..Options::default()
     };
     let mut db = Database::open_with(dir.path(), opts).unwrap();
     db.put(b"k", b"v1").unwrap();

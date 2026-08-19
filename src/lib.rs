@@ -1,7 +1,5 @@
 pub mod codec;
 pub mod compaction;
-#[cfg(feature = "bench-diag")]
-pub mod diag;
 pub mod entity;
 pub mod error;
 pub mod index;
@@ -20,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use error::Result;
 use iterator::{MergeIter, ScanIter, ScanSource, memtable_source, merge_vecs};
-use manifest::Manifest;
+use manifest::{Manifest, SegmentMeta};
 use memtable::{Entry, MemTable};
 use wal::Wal;
 
@@ -28,12 +26,19 @@ use wal::Wal;
 pub const DEFAULT_MEMTABLE_LIMIT: usize = 4 * 1024 * 1024;
 /// Ab wie vielen Tabellen in Level 0 kompaktiert wird.
 pub const DEFAULT_L0_COMPACT_THRESHOLD: usize = 4;
+/// Standard-Record-Obergrenze pro L1-Segment (Split-Regel §11.2 der
+/// Design-Spez: deterministisch, keine Größensteuerung). Größenordnung im
+/// Bereich des MemTable-Limits.
+pub const DEFAULT_SEGMENT_MAX_RECORDS: usize = 30_000;
 
 /// Konfiguration der Datenbank.
 #[derive(Clone)]
 pub struct Options {
     pub memtable_limit: usize,
     pub l0_compact_threshold: usize,
+    /// Deterministische Split-Regel für die L1-Segmente: ein Segment wird
+    /// geschlossen, sobald es diese Record-Anzahl erreicht.
+    pub segment_max_records: usize,
 }
 
 impl Default for Options {
@@ -41,6 +46,7 @@ impl Default for Options {
         Options {
             memtable_limit: DEFAULT_MEMTABLE_LIMIT,
             l0_compact_threshold: DEFAULT_L0_COMPACT_THRESHOLD,
+            segment_max_records: DEFAULT_SEGMENT_MAX_RECORDS,
         }
     }
 }
@@ -96,6 +102,11 @@ impl Database {
             next_tx_id: 0,
         };
 
+        // Manifest-Reconstruction (§12.3): Legacy-L1-Konvertierung + harte
+        // Validierung von Datei-Existenz und Segment-Ranges.
+        db.convert_legacy_l1()?;
+        db.validate_open_state()?;
+
         // Recovery: WAL in die MemTable einspielen. Die höchste gesehene
         // Transaktions-ID (auch uncommitteter) übernehmen, damit nach einem
         // Crash keine TX-ID in demselben WAL wiederverwendet wird.
@@ -106,6 +117,79 @@ impl Database {
         db.next_tx_id = replay.max_tx_id + 1;
 
         Ok(db)
+    }
+
+    /// Legacy-Konvertierung (§12.3): Alte `L 1`-Tabellen (v0.7-C/1d-Ära) ohne
+    /// Segment-Metadaten werden in Segmente überführt, Range aus dem
+    /// SSTable-Index abgeleitet. Danach gelten die Segment-Invarianten.
+    fn convert_legacy_l1(&mut self) -> Result<()> {
+        if !self.manifest.segments.is_empty() {
+            return Ok(());
+        }
+        let Some(legacy) = self.manifest.levels.get(1).cloned() else {
+            return Ok(());
+        };
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        for id in legacy {
+            let path = self.table_path(id);
+            let reader = sstable::TableReader::open(&path)?;
+            let Some((first, last)) = reader.key_bounds() else {
+                return Err(crate::error::Error::Corrupt(
+                    "legacy L1 table without index keys",
+                ));
+            };
+            self.manifest.segments.push(SegmentMeta {
+                file_id: id,
+                min_key: first.to_vec(),
+                max_key: last.to_vec(),
+                records: reader.num_records(),
+            });
+        }
+        self.manifest
+            .segments
+            .sort_unstable_by(|a, b| a.min_key.cmp(&b.min_key));
+        while self.manifest.levels.len() <= 1 {
+            self.manifest.levels.push(Vec::new());
+        }
+        self.manifest.levels[1] = Vec::new();
+        self.manifest.validate()
+    }
+
+    /// Harte Validierung beim Öffnen (§12.3): keine Manifest-Referenz darf auf
+    /// eine fehlende Datei zeigen; die Segment-Range muss mit dem Index der
+    /// Datei übereinstimmen. Verstöße sind `Corrupt`, kein stilles Droppen.
+    fn validate_open_state(&self) -> Result<()> {
+        for level in &self.manifest.levels {
+            for id in level {
+                if !self.table_path(*id).exists() {
+                    return Err(crate::error::Error::Corrupt(
+                        "manifest references missing L0 table",
+                    ));
+                }
+            }
+        }
+        for seg in &self.manifest.segments {
+            let path = self.table_path(seg.file_id);
+            if !path.exists() {
+                return Err(crate::error::Error::Corrupt(
+                    "manifest references missing segment file",
+                ));
+            }
+            let reader = sstable::TableReader::open(&path)?;
+            let Some((first, last)) = reader.key_bounds() else {
+                return Err(crate::error::Error::Corrupt(
+                    "segment table without index keys",
+                ));
+            };
+            if first != seg.min_key.as_slice() || last != seg.max_key.as_slice() {
+                return Err(crate::error::Error::Corrupt(
+                    "segment range mismatch with table index",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Löscht einen Schlüssel (Tombstone).
@@ -194,11 +278,8 @@ impl Database {
         if let Some(entry) = self.memtable.get(key) {
             return Ok(entry.clone());
         }
-        for level in 0..self.manifest.levels.len() {
-            let Some(ids) = self.manifest.levels.get(level) else {
-                continue;
-            };
-            // Innerhalb des Levels neueste Tabelle zuerst.
+        // L0: neueste Tabelle zuerst.
+        if let Some(ids) = self.manifest.levels.first() {
             for id in ids.iter().rev() {
                 let hit = if let Some(reader) = self.table_cache.get_mut(id) {
                     reader.lookup(key)?
@@ -217,7 +298,52 @@ impl Database {
                 }
             }
         }
+        // L1: genau das eine Segment, dessen [min_key, max_key] den Key enthält.
+        if let Some(i) = self.find_segment(key) {
+            let id = self.manifest.segments[i].file_id;
+            let hit = if let Some(reader) = self.table_cache.get_mut(&id) {
+                reader.lookup(key)?
+            } else {
+                let path = self.table_path(id);
+                let mut reader = sstable::TableReader::open(&path)?;
+                let result = reader.lookup(key)?;
+                self.table_cache.insert(id, reader);
+                result
+            };
+            if let Some(entry) = hit {
+                return Ok(entry);
+            }
+        }
         Ok(None)
+    }
+
+    /// Binary-Search: das eine L1-Segment, dessen `[min_key, max_key]` `key`
+    /// enthält (Disjunktheits-Invariante garantiert max. ein Treffer).
+    fn find_segment(&self, key: &[u8]) -> Option<usize> {
+        let segs = &self.manifest.segments;
+        if segs.is_empty() {
+            return None;
+        }
+        // Letztes Segment mit min_key <= key.
+        let mut lo = 0usize;
+        let mut hi = segs.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if segs[mid].min_key.as_slice() <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return None;
+        }
+        let i = lo - 1;
+        if key <= segs[i].max_key.as_slice() {
+            Some(i)
+        } else {
+            None
+        }
     }
 
     /// Bereichs-Scan `[start, end)`. Lazy — materialisiert **nicht** die
@@ -232,8 +358,9 @@ impl Database {
         // MemTable ist die neueste Quelle (Index 0). Kopie ist beschränkt
         // (≤ memtable_limit) und über den exklusiven Borrow konsistent.
         sources.push(Box::new(memtable_source(&self.memtable, start, end)));
-        for level in &self.manifest.levels {
-            for id in level.iter().rev() {
+        // L0: neueste zuerst.
+        if let Some(ids) = self.manifest.levels.first() {
+            for id in ids.iter().rev() {
                 // Gecachte Reader wiederverwenden (Index/Bloom/Handle teilen),
                 // statt pro Scan jede Datei neu zu öffnen — sonst O(Tabellen) pro
                 // Scan und quadratisch über viele Puts.
@@ -247,19 +374,42 @@ impl Database {
                 )?));
             }
         }
+        // L1-Segmente (disjunkt, sortiert nach min_key; jede Reihenfolge als
+        // Quelle ist korrekt, da sich die Ranges nicht überlappen).
+        for seg in &self.manifest.segments {
+            let id = seg.file_id;
+            if !self.table_cache.contains_key(&id) {
+                self.table_cache
+                    .insert(id, sstable::TableReader::open(&self.table_path(id))?);
+            }
+            let reader = self.table_cache.get(&id).expect("cached").fork()?;
+            sources.push(Box::new(sstable::TableIter::from_reader(
+                reader, start, end,
+            )?));
+        }
         let merge = MergeIter::new(sources);
         Ok(ScanIter::new(self, merge))
     }
 
     /// Bereichs-Scan `[start, end)`. Liefert sortierte `(key, Option<value>)`.
     /// Komfort-Wrapper: sammelt [`scan_stream`](Self::scan_stream) ein.
+    ///
+    /// Tombstones (`None`) werden **nicht** ausgegeben: gelöschte Keys tauchen in
+    /// Scans nicht auf, unabhängig davon, ob ihr Tombstone bereits bei einer
+    /// Compaction physisch entfernt wurde. So ist ein Scan vor/nach Compaction
+    /// identisch. (`scan_stream` ist die rohe, lazy Variante und liefert die
+    /// Tombstones weiterhin als `None`.)
     pub fn scan(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        self.scan_stream(start, end)?
-            .collect::<std::result::Result<Vec<_>, _>>()
+        Ok(self
+            .scan_stream(start, end)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, v)| v.is_some())
+            .collect())
     }
 
     /// Erzwingt das Flushen der aktuellen MemTable als SSTable (Level 0).
@@ -285,74 +435,114 @@ impl Database {
         self.manifest.save(&self.manifest_path)?;
         self.table_cache.clear(); // Struktur hat sich geändert
 
-        // WAL leeren: alle Daten sind jetzt persistiert.
-        wal::clear(&self.wal_path)?;
+        // WAL leeren: alle Daten sind jetzt persistiert. MUSS über den Wal-Handle
+        // laufen, damit der BufWriter-Puffer verworfen wird (sonst schreibt ein
+        // späteres sync() die alten Records zurück in den geleerten Log).
+        self.wal.truncate()?;
         self.memtable = MemTable::new();
 
         // Optional kompaktieren.
         if self.manifest.levels[0].len() >= self.opts.l0_compact_threshold {
-            self.compact_level(0)?;
+            self.compact()?;
         }
         Ok(())
     }
 
-    /// Mergt Level `level` in Level `level + 1` zu einer neuen SSTable.
-    fn compact_level(&mut self, level: usize) -> Result<()> {
-        let level_records = self.merge_level(level);
-        let next_records = self.merge_level(level + 1);
+    /// 3a-Compaction (Overlap-Merge): hält L0 klein und ordnet die L0-Tabellen
+    /// in die L1-Segmente ein, ohne die komplette L1-Basis neu zu schreiben.
+    ///
+    /// Nur die L1-Segmente, deren Key-Range den L0-Batch-Span schneidet, werden
+    /// gelesen und durch neue Segmente ersetzt; nicht-überlappende Segmente
+    /// bleiben unangetastet (gleiche Datei, gleiche Range). Tombstones dürfen
+    /// physisch entfallen: für jeden Key im Merge-Span liegt die komplette
+    /// Historie im Merge-Set (Disjunktheits-Invariante + alle L0-Tabellen im
+    /// Batch).
+    fn compact(&mut self) -> Result<()> {
+        let l0 = self.manifest.levels.get(0).cloned().unwrap_or_default();
+        if l0.len() < self.opts.l0_compact_threshold {
+            return Ok(());
+        }
+        let (batch_min, batch_max) = self
+            .table_bounds(&l0)
+            .ok_or_else(|| crate::error::Error::Corrupt("empty L0 table in compact"))?;
 
-        let merged = merge_vecs(vec![level_records, next_records])?;
-
-        // Neuen Schlüssel vergeben.
-        let new_id = self.manifest.next_table_id;
-        self.manifest.next_table_id += 1;
-        let new_path = self.table_path(new_id);
-        // build_table_from_sorted führt bereits ein fsync der neuen SSTable aus.
-        compaction::build_table_from_sorted(&new_path, &merged)?;
-
-        // Alte Tabellen aus dem Manifest entfernen + neue aufnehmen.
-        let removed: Vec<u64> = self
+        // Überlappende Segmente mergen, Rest behalten.
+        let overlaps = |s: &SegmentMeta| {
+            s.min_key.as_slice() <= batch_max.as_slice()
+                && s.max_key.as_slice() >= batch_min.as_slice()
+        };
+        let overlap_ids: Vec<u64> = self
             .manifest
-            .levels
-            .get(level)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .chain(
-                self.manifest
-                    .levels
-                    .get(level + 1)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
+            .segments
+            .iter()
+            .filter(|s| overlaps(s))
+            .map(|s| s.file_id)
             .collect();
-        if self.manifest.levels.len() <= level + 1 {
+        let retained: Vec<SegmentMeta> = self
+            .manifest
+            .segments
+            .iter()
+            .filter(|s| !overlaps(s))
+            .cloned()
+            .collect();
+
+        // Merge: L0-Tabellen (neueste zuerst) + überlappende Segmente.
+        let mut input_ids: Vec<u64> = l0.iter().copied().rev().collect();
+        input_ids.extend(overlap_ids.iter().copied());
+        let merged = self.merge_ids(&input_ids, true)?;
+
+        // Deterministischer Split: Chunks von `segment_max_records` → Segmente.
+        let mut new_segments: Vec<SegmentMeta> = Vec::new();
+        for chunk in merged.chunks(self.opts.segment_max_records) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let id = self.write_table(chunk)?;
+            new_segments.push(SegmentMeta {
+                file_id: id,
+                min_key: chunk[0].0.clone(),
+                max_key: chunk[chunk.len() - 1].0.clone(),
+                records: chunk.len() as u64,
+            });
+        }
+
+        // Neue L1 = beibehaltene + neue Segmente, sortiert nach min_key.
+        let mut all = retained;
+        all.extend(new_segments);
+        all.sort_unstable_by(|a, b| a.min_key.cmp(&b.min_key));
+        self.manifest.segments = all;
+
+        // Manifest-COMMIT (fsync + atomarer rename) MUSS vor dem Löschen der
+        // alten SSTables passieren (Crash-Fenster §13 der Design-Spez).
+        while self.manifest.levels.len() < 1 {
             self.manifest.levels.push(Vec::new());
         }
-        self.manifest.levels[level] = Vec::new();
-        self.manifest.levels[level + 1] = vec![new_id];
-        // Manifest-COMMIT (fsync + atomarer rename) MUSS vor dem Löschen der
-        // alten SSTables passieren. Sonst verweist das Manifest nach einem Crash
-        // auf bereits gelöschte Dateien. Verbleibende alte Dateien sind nach einem
-        // Crash einfach Orphaned Garbage, das später aufgeräumt werden kann.
+        self.manifest.levels[0] = Vec::new();
         self.manifest.save(&self.manifest_path)?;
-        self.table_cache.clear(); // alte gelöscht, neue Tabelle entstanden
-
-        // Erst NACH dem Commit die alten SSTable-Dateien von der Platte entfernen.
-        for id in &removed {
+        self.table_cache.clear(); // alte gelöscht, neue Segmente entstanden
+        for id in &l0 {
             let _ = std::fs::remove_file(self.table_path(*id));
+        }
+        for &id in &overlap_ids {
+            let _ = std::fs::remove_file(self.table_path(id));
         }
         Ok(())
     }
 
-    /// Lädt alle Tabellen eines Levels und mergt sie (neuere = höherer Index gewinnt).
-    fn merge_level(&mut self, level: usize) -> Vec<(Vec<u8>, Entry)> {
-        let Some(ids) = self.manifest.levels.get(level) else {
-            return Vec::new();
-        };
+    /// Mergt die gegebenen Tabellen-IDs in der uebergebenen Reihenfolge
+    /// **neueste zuerst** (erste Quelle gewinnt bei Key-Kollision = LWW).
+    /// Der Aufrufer garantiert die Ordnung: L0-Tabellen (desc nach ID) vor
+    /// L1-Segmenten (disjunkt, Reihenfolge egal).
+    /// `drop_tombstones` steuert, ob endgueltige Tombstones (resultierender Wert
+    /// `None`) physisch entfernt werden - nur zulaessig, wenn die komplette
+    /// Historie jedes betroffenen Keys im Merge-Set liegt (11.1 der Spez).
+    fn merge_ids(
+        &self,
+        ids: &[u64],
+        drop_tombstones: bool,
+    ) -> Result<Vec<(Vec<u8>, Entry)>> {
         let mut sources = Vec::new();
-        // Höherer Index = neuer → zuerst, damit er im Merge gewinnt.
-        for id in ids.iter().rev() {
+        for id in ids {
             let path = self.table_path(*id);
             if let Ok(mut reader) = sstable::TableReader::open(&path) {
                 if let Ok(records) = reader.iter() {
@@ -360,7 +550,46 @@ impl Database {
                 }
             }
         }
-        merge_vecs(sources).unwrap_or_default()
+        let mut merged = merge_vecs(sources)?;
+        if drop_tombstones {
+            merged.retain(|(_, v)| v.is_some());
+        }
+        Ok(merged)
+    }
+
+    /// `[min_key, max_key]`-Span ueber mehrere Tabellen (erste/letzte Index-Keys).
+    fn table_bounds(&self, ids: &[u64]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut min: Option<Vec<u8>> = None;
+        let mut max: Option<Vec<u8>> = None;
+        for id in ids {
+            let path = self.table_path(*id);
+            if let Ok(reader) = sstable::TableReader::open(&path) {
+                if let Some((first, last)) = reader.key_bounds() {
+                    let f = first.to_vec();
+                    let l = last.to_vec();
+                    if min.as_ref().map_or(true, |m| f < *m) {
+                        min = Some(f);
+                    }
+                    if max.as_ref().map_or(true, |m| l > *m) {
+                        max = Some(l);
+                    }
+                }
+            }
+        }
+        match (min, max) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    /// Schreibt eine neue SSTable mit frischer ID und gibt die ID zurück.
+    /// `build_table_from_sorted` fsynct die neue Datei bereits.
+    fn write_table(&mut self, records: &[(Vec<u8>, Entry)]) -> Result<u64> {
+        let new_id = self.manifest.next_table_id;
+        self.manifest.next_table_id += 1;
+        let path = self.table_path(new_id);
+        compaction::build_table_from_sorted(&path, records)?;
+        Ok(new_id)
     }
 
     fn table_path(&self, id: u64) -> PathBuf {
@@ -377,7 +606,26 @@ impl Database {
     }
 
     pub fn level_tables(&self, level: usize) -> usize {
+        if level == 1 {
+            return self.manifest.segments.len();
+        }
         self.manifest.levels.get(level).map_or(0, Vec::len)
+    }
+
+    /// Anzahl der L1-Segmente (für Tests/Inspektion).
+    pub fn segment_count(&self) -> usize {
+        self.manifest.segments.len()
+    }
+
+    /// Segment-Metadaten (für Tests/Inspektion der Disjunktheits-Invariante).
+    pub fn segments(&self) -> &[SegmentMeta] {
+        &self.manifest.segments
+    }
+
+    /// Alle Tabellen-IDs, die aktuell im Manifest referenziert werden (für
+    /// Tests/Inspektion: prüft, dass keine Referenz auf fehlende Dateien besteht).
+    pub fn table_ids(&self) -> Vec<u64> {
+        self.manifest.all_ids()
     }
 
     /// Sauber schließen: MemTable flushen, WAL + Manifest dauerhaft machen.
@@ -434,7 +682,8 @@ pub struct DirectMutator<'a> {
 
 impl<'a> Mutator for DirectMutator<'a> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db.get(key)
+        let r = self.db.get(key);
+        r
     }
     fn scan<'s>(&'s mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream<'s>> {
         Ok(Box::new(self.db.scan_stream(start, end)?))
@@ -476,6 +725,13 @@ mod tests {
                 }
             }
         }
+        for seg in &db.manifest.segments {
+            if let Ok(mut r) = sstable::TableReader::open(&db.table_path(seg.file_id)) {
+                if let Ok(recs) = r.iter() {
+                    order.push(recs);
+                }
+            }
+        }
         // order[0] ist die neueste Quelle → erster Insert pro Key gewinnt.
         let mut best: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for src in order {
@@ -485,7 +741,10 @@ mod tests {
                 }
             }
         }
-        best.into_iter().collect()
+        // `scan()` gibt keine Tombstones aus (gelöschte Keys erscheinen nicht).
+        best.into_iter()
+            .filter(|(_, v)| v.is_some())
+            .collect()
     }
 
     fn setup(dir: &Path) -> Database {

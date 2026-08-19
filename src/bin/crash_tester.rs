@@ -25,8 +25,10 @@ fn main() {
 
     match mode.as_str() {
         "seed" => seed(dir, n),
+        "seedc" => seed_compaction(dir, n),
         "write" => write_all(dir, n),
         "verify" => verify(dir, n),
+        "verifyc" => verify_compaction(dir, n),
         _ => {
             eprintln!("unknown mode {mode}");
             process::exit(2);
@@ -39,6 +41,7 @@ fn write_all(dir: &std::path::Path, n: usize) {
     let opts = Options {
         memtable_limit: 4 * 1024 * 1024,
         l0_compact_threshold: 4,
+        ..Options::default()
     };
     let mut db = Database::open_with(dir, opts).expect("open");
     for i in 0..n {
@@ -54,6 +57,7 @@ fn seed(dir: &std::path::Path, n: usize) {
     let opts = Options {
         memtable_limit: 4 * 1024 * 1024, // erzwingt Flushes während der Schreibphase
         l0_compact_threshold: 4,
+        ..Options::default()
     };
     let mut db = Database::open_with(dir, opts).expect("open");
 
@@ -82,10 +86,106 @@ fn seed(dir: &std::path::Path, n: usize) {
     process::exit(0);
 }
 
-fn verify(dir: &std::path::Path, n: usize) {
+/// Compaction-schwerer Seed: niedriger L0-Schwellwert + Updates + Deletes,
+/// sodass Flush UND Compaction (Flatten/Konsolidierung) während der Schreibphase
+/// ablaufen. Der `abort` kann an jedem Punkt innerhalb der Compaction-Sequenz
+/// landen → deckt die drei Crash-Fenster ab (SSTable geschrieben ohne Manifest-
+/// Commit; Manifest-COMMIT mit alten Dateien; Manifest-COMMIT nach Datei-Löschung).
+fn seed_compaction(dir: &std::path::Path, n: usize) {
+    let opts = Options {
+        memtable_limit: 256 * 1024, // häufige Flushes
+        l0_compact_threshold: 2,    // Compaction bereits nach 2 L0-Tabellen
+        ..Options::default()
+    };
+    let mut db = Database::open_with(dir, opts).expect("open");
+
+    let rnd = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let kill_at = rnd % (n as u64);
+
+    for i in 0..n {
+        let key = format!("key-{:08}", i % 2000).into_bytes();
+        match i % 5 {
+            0 => {
+                db.delete(&key).expect("delete");
+            }
+            _ => {
+                let val = format!("value-{}", i).into_bytes();
+                db.put(&key, &val).expect("put");
+            }
+        }
+        // Flush alle 8 Keys, um L0 zu füllen → triggert kompakt beim Schwellwert.
+        // (Nicht pro Key: das wäre 100k fsync in debug; alle 8 reicht, um Flush
+        // und Compaction zuverlässig über die Schreibphase zu streuen.)
+        if i % 8 == 0 {
+            db.flush().expect("flush");
+        }
+
+        if i as u64 == kill_at {
+            process::abort();
+        }
+    }
+    process::exit(0);
+}
+
+/// Verifiziert den compaction-schweren Seed: Jeder vorhandene Key muss einen
+/// Wert tragen, der zu diesem Key tatsächlich geschrieben wurde (keine
+/// Korruption). Da Keys überschrieben werden, ist jede zu `i % 2000 == k` und
+/// `i % 5 != 0` geschriebene `value-{i}` ein gültiger Wert. Zusätzlich wird
+/// geprüft, dass keine Manifest-Referenz auf eine fehlende Datei zeigt.
+fn verify_compaction(dir: &std::path::Path, n: usize) {
+    // Gültige Werte pro Key-Index (deterministisch aus der Seed-Sequenz).
+    let mut valid: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        if i % 5 == 0 {
+            continue; // delete → kein Wert
+        }
+        let k = (i % 2000) as u32;
+        valid.entry(k).or_default().push(format!("value-{}", i).into_bytes());
+    }
+    for vals in valid.values_mut() {
+        vals.sort();
+        vals.dedup();
+    }
+
     let mut db = Database::open(dir).expect("reopen");
 
-    // Ein einziger Scan über alle Keys (statt n einzelner get) → O(n) statt O(n²).
+    // Keine Manifest-Referenz auf fehlende Dateien.
+    for id in db.table_ids() {
+        let p = dir.join(format!("{:06}.sst", id));
+        if !p.exists() {
+            eprintln!("CORRUPTION: manifest refs missing file {p:?}");
+            process::exit(1);
+        }
+    }
+
+    let rows = db.scan(None, None).expect("scan");
+    for (key, val) in &rows {
+        let s = String::from_utf8_lossy(key);
+        let num: u32 = s
+            .trim_start_matches("key-")
+            .parse()
+            .expect("parse key number");
+        let Some(vals) = valid.get(&num) else {
+            eprintln!("CORRUPTION: unexpected key {s:?}");
+            process::exit(1);
+        };
+        if let Some(v) = val
+            && !vals.contains(v)
+        {
+            eprintln!("CORRUPTION: key {s:?} has foreign value {v:?}");
+            process::exit(1);
+        }
+    }
+    println!("verifyc OK ({n} keys, {} rows)", rows.len());
+    process::exit(0);
+}
+
+fn verify(dir: &std::path::Path, n: usize) {
+    let mut db = Database::open(dir).expect("reopen");
     let rows = db.scan(None, None).expect("scan");
 
     // Invariante: Jeder Key, der existiert, muss den korrekten Wert haben.

@@ -208,8 +208,9 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 use my_lsm_db::{Database, Options};
 
 let opts = Options {
-    memtable_limit: 4 * 1024 * 1024, // Byte, ab wann geflusht wird
+    memtable_limit: 4 * 1024 * 1024,  // Byte, ab wann geflusht wird
     l0_compact_threshold: 4,          // ab wie vielen L0-Tabellen kompaktiert wird
+    segment_max_records: 30_000,      // deterministische L1-Segment-Split-Regel
 };
 ```
 

@@ -44,6 +44,36 @@ fn crash_recovery_no_corruption() {
 }
 
 #[test]
+fn compaction_crash_recovery_no_corruption() {
+    // Compaction-schwerer Seed (Updates + Deletes, niedriger L0-Schwellwert):
+    // der `abort` kann in jedem der drei Crash-Fenster der Compaction landen.
+    const N_C: usize = 1000;
+    const RUNS_C: usize = 6;
+    for run in 0..RUNS_C {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("lsm_ccrash_{}_{}", std::process::id(), run));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _ = Command::new(crash_tester())
+            .args(["seedc", dir.to_str().unwrap(), &N_C.to_string()])
+            .status()
+            .expect("run seedc");
+
+        let verify = Command::new(crash_tester())
+            .args(["verifyc", dir.to_str().unwrap(), &N_C.to_string()])
+            .output()
+            .expect("run verifyc");
+        assert!(
+            verify.status.success(),
+            "verifyc failed in run {run}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn clean_close_persists_everything() {
     let dir: PathBuf = std::env::temp_dir().join(format!("lsm_clean_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
