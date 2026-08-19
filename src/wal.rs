@@ -29,11 +29,15 @@ pub struct Wal {
 
 impl Wal {
     pub fn create(path: &Path) -> Result<Wal> {
-        let file = OpenOptions::new()
+        // read+write (nicht append-only): append-Modus verwehrt auf Windows
+        // `SetEndOfFile` (braucht FILE_WRITE_DATA) und macht `set_len` in
+        // `truncate()` unmöglich. Wir emulieren append über seek(ans Ende).
+        let mut file = OpenOptions::new()
             .create(true)
-            .read(false)
-            .append(true)
+            .read(true)
+            .write(true)
             .open(path)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Wal {
             file: BufWriter::new(file),
         })
@@ -112,6 +116,22 @@ impl Wal {
     /// Schreibt einen Puffer-Punkt; nur Puffer leeren, kein fsync.
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
+        Ok(())
+    }
+
+    /// Leert den Log **nach** erfolgreichem Flush in eine SSTable: alle
+    /// gepufferten und bereits geschriebenen Records entfallen, die Datei wird
+    /// auf Länge 0 gekürzt und die Schreibposition zurückgesetzt. Anders als
+    /// `fs::set_len` auf einem separaten Handle muss hier auch der
+    /// `BufWriter`-Puffer verworfen werden — sonst schreibt ein späteres
+    /// `sync()`/`flush()` die bereits persistierten Bytes zurück in den
+    /// scheinbar geleerten Log (Reopen würde die komplette Historie erneut
+    /// in die MemTable replizieren).
+    pub fn truncate(&mut self) -> Result<()> {
+        self.file.flush()?;
+        let f = self.file.get_mut();
+        f.set_len(0)?;
+        f.seek(SeekFrom::Start(0))?;
         Ok(())
     }
 }
@@ -342,6 +362,9 @@ pub fn replay(path: &Path) -> Result<ReplayResult> {
 }
 
 /// Löscht die WAL-Datei nach erfolgreichem Flush (Log wird neu gestartet).
+/// Veraltet: nutzt `Wal::truncate()`, das zusätzlich den BufWriter-Puffer der
+/// lebenden Wal verwirft (siehe dort).
+#[allow(dead_code)]
 pub fn clear(path: &Path) -> Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.set_len(0)?;
@@ -453,5 +476,51 @@ mod tests {
 
         let res = replay(&path).unwrap();
         assert!(res.records.len() <= 1);
+    }
+
+    /// Regression für `Wal::truncate()`: nach dem Leeren darf ein späteres
+    /// `sync()`/`flush()` die bereits persistierten Bytes NICHT zurück in den
+    /// (scheinbar geleerten) Log schreiben, und ein Reopen muss den geleerten
+    /// Zustand sehen. Der Bug entstand, wenn nur `fs::set_len` auf einem
+    /// separaten Handle lief, während der `BufWriter`-Puffer der lebenden Wal
+    /// die alten Records noch hielt.
+    #[test]
+    fn truncate_drops_buffered_records_and_reopen_sees_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        // 1) Schreiben + sync → Daten liegen physisch.
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.append(b"a", Some(b"1")).unwrap();
+            wal.append(b"b", Some(b"2")).unwrap();
+            wal.append(b"c", Some(b"3")).unwrap();
+            wal.sync().unwrap();
+        }
+        assert_eq!(replay(&path).unwrap().records.len(), 3);
+
+        // 2) Wal reopenen, truncate() → BufWriter-Puffer + Datei geleert.
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.truncate().unwrap();
+            wal.sync().unwrap(); // darf nichts Altes zurück schreiben
+        }
+        assert_eq!(replay(&path).unwrap().records.len(), 0);
+
+        // 3) Neue Daten nach truncate() müssen sauber erscheinen.
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.append(b"x", Some(b"9")).unwrap();
+            wal.sync().unwrap();
+        }
+        let res = replay(&path).unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(
+            res.records[0],
+            WalRecord {
+                key: b"x".to_vec(),
+                value: Some(b"9".to_vec())
+            }
+        );
     }
 }
