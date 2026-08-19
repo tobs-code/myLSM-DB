@@ -18,6 +18,12 @@ pub struct TableBuilder {
     keys_since_index: usize,
     num_records: u64,
     bloom: BloomFilter,
+    last_key: Option<Vec<u8>>,
+    last_offset: u64,
+    /// Hat der zuletzt hinzugefügte Record einen Index-Eintrag bekommen
+    /// (nur Block-Start-Records tun das)? Steuert den finalen Index-Eintrag
+    /// in `finish()`, damit `key_bounds().last` exakt ist.
+    last_record_indexed: bool,
 }
 
 impl TableBuilder {
@@ -30,6 +36,9 @@ impl TableBuilder {
             keys_since_index: 0,
             num_records: 0,
             bloom: BloomFilter::new(1024, 4),
+            last_key: None,
+            last_offset: 0,
+            last_record_indexed: false,
         })
     }
 
@@ -46,12 +55,16 @@ impl TableBuilder {
             self.index.extend_from_slice(key);
             self.index.extend_from_slice(&offset.to_le_bytes());
         }
+        self.last_record_indexed = self.keys_since_index == 0;
         self.keys_since_index += 1;
         if self.keys_since_index == self.spacing {
             self.keys_since_index = 0;
         }
 
         self.bloom.insert(key);
+
+        self.last_key = Some(key.to_vec());
+        self.last_offset = offset;
 
         self.buf
             .extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -66,7 +79,20 @@ impl TableBuilder {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<u64> {
+    pub fn finish(mut self) -> Result<u64> {
+        // Exakte Obergrenze für `key_bounds()`: Der sparse Index enthält nur
+        // Einträge an Block-Grenzen. Ist der letzte Record keine Block-Grenze,
+        // wird er als zusätzlicher finaler Index-Eintrag angehängt, damit die
+        // Segment-Range (max_key) und der Index übereinstimmen (§9.2).
+        if self.num_records > 0 && !self.last_record_indexed {
+            if let Some(lk) = &self.last_key {
+                self.index
+                    .extend_from_slice(&(lk.len() as u32).to_le_bytes());
+                self.index.extend_from_slice(lk);
+                self.index
+                    .extend_from_slice(&self.last_offset.to_le_bytes());
+            }
+        }
         let bloom_bytes = self.bloom.to_bytes();
         let index_offset = self.buf.len() as u64;
         let index_len = self.index.len() as u32;
@@ -195,14 +221,23 @@ impl TableReader {
     /// Billiger Klon für Scans: teilt Index/Bloom/Handle, aber mit eigenem,
     /// unabhängig positionierbarem Lese-Puffer. Kein erneuter Datei-/Index-Read.
     pub fn fork(&self) -> Result<TableReader> {
-        Ok(TableReader {
+        let r = Ok(TableReader {
             shared: std::sync::Arc::clone(&self.shared),
             file: BufReader::new(self.shared.file.try_clone()?),
-        })
+        });
+        r
     }
 
     pub fn num_records(&self) -> u64 {
         self.shared.num_records
+    }
+
+    /// Erster und letzter Key der Tabelle (aus dem sparse Index) — für die
+    /// Segment-Range-Bestimmung und die Manifest-Validierung (§9.2/§12.3).
+    pub fn key_bounds(&self) -> Option<(&[u8], &[u8])> {
+        let first = self.shared.index_entries.first()?;
+        let last = self.shared.index_entries.last()?;
+        Some((&first.key, &last.key))
     }
 
     /// Sucht den Block-Start-Offset für `key` über binäre Suche im Index.
@@ -492,6 +527,30 @@ mod tests {
         assert_eq!(r.lookup(b"b").unwrap(), Some(None));
         // nicht vorhanden → None
         assert_eq!(r.lookup(b"zz").unwrap(), None);
+    }
+
+    #[test]
+    fn key_bounds_exact_at_block_alignment() {
+        // Regression: `key_bounds().last` muss auch dann exakt der letzte
+        // Record sein, wenn die Record-Zahl ein Vielfaches von `spacing` ist
+        // (der letzte Record ist dann KEINE Block-Grenze und bekommt über den
+        // Block-Start-Eintrag keinen Index-Platz). Sonst stimmt die Segment-
+        // Range nicht mit dem Index überein → `validate_open_state` meldet
+        // fälschlich `Corrupt`.
+        let dir = tempfile::tempdir().unwrap();
+        for n in [16usize, 30_000] {
+            let path = dir.path().join(format!("t{n}.sst"));
+            let mut b = TableBuilder::new(&path).unwrap();
+            for i in 0..n {
+                let k = format!("k{:08}", i);
+                b.add(k.as_bytes(), Some(b"v".as_slice())).unwrap();
+            }
+            b.finish().unwrap();
+            let r = TableReader::open(&path).unwrap();
+            let (first, last) = r.key_bounds().unwrap();
+            assert_eq!(first, b"k00000000".as_slice());
+            assert_eq!(last, format!("k{:08}", n - 1).as_bytes());
+        }
     }
 
     #[test]
