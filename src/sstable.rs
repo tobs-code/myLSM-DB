@@ -96,7 +96,19 @@ impl TableBuilder {
 
 /// Ein unveränderliches, sortiertes Segment — gelesen.
 pub struct TableReader {
+    /// Gemeinsam geteilter, einmalig geöffneter/geparster Zustand. Mehrere
+    /// `TableReader`-Klone teilen sich File-Handle, sparse Index und Bloom,
+    /// sodass ein `fork()` (für Scans) keinen erneuten Datei-/Index-Read kostet.
+    shared: std::sync::Arc<SharedTable>,
+    /// Eigenes Lesepuffer-Objekt über einen duplizierten Handle. Position ist
+    /// pro `TableReader` unabhängig (wir seeken vor jedem Lesevorgang).
     file: BufReader<File>,
+}
+
+/// Der teilsbare, unveränderliche Zustand einer geöffneten SSTable.
+struct SharedTable {
+    /// Geteiltes OS-File-Handle. `fork` dupliziert es via `try_clone`.
+    file: File,
     num_records: u64,
     bloom: Option<BloomFilter>,
     /// Einmalig beim Öffnen geparster sparse Index (Key → Block-Offset).
@@ -167,17 +179,30 @@ impl TableReader {
             None
         };
 
+        let shared_file = file.get_ref().try_clone()?;
         Ok(TableReader {
+            shared: std::sync::Arc::new(SharedTable {
+                file: shared_file,
+                num_records,
+                bloom,
+                index_entries: parse_index(&index),
+                data_end: index_offset,
+            }),
             file,
-            index_entries: parse_index(&index),
-            num_records,
-            bloom,
-            data_end: index_offset,
+        })
+    }
+
+    /// Billiger Klon für Scans: teilt Index/Bloom/Handle, aber mit eigenem,
+    /// unabhängig positionierbarem Lese-Puffer. Kein erneuter Datei-/Index-Read.
+    pub fn fork(&self) -> Result<TableReader> {
+        Ok(TableReader {
+            shared: std::sync::Arc::clone(&self.shared),
+            file: BufReader::new(self.shared.file.try_clone()?),
         })
     }
 
     pub fn num_records(&self) -> u64 {
-        self.num_records
+        self.shared.num_records
     }
 
     /// Sucht den Block-Start-Offset für `key` über binäre Suche im Index.
@@ -203,7 +228,7 @@ impl TableReader {
     fn read_record(&mut self) -> Result<Option<(Vec<u8>, Entry)>> {
         // Nie über die physische Record-Grenze hinaus lesen (Index/Bloom/Footer
         // sind keine Records). Schützt lookup() vor Fehlinterpretation.
-        if self.file.stream_position()? >= self.data_end {
+        if self.file.stream_position()? >= self.shared.data_end {
             return Ok(None);
         }
         let mut len_buf = [0u8; 8];
@@ -236,12 +261,12 @@ impl TableReader {
     /// oder `None` für Tombstone). `Ok(None)` = Key definitiv nicht vorhanden.
     /// Nutzt Bloom (falls vorhanden) + sparse Index + linearen Scan.
     pub fn lookup(&mut self, key: &[u8]) -> Result<Option<Entry>> {
-        if let Some(bloom) = &self.bloom {
+        if let Some(bloom) = &self.shared.bloom {
             if !bloom.maybe_contains(key) {
                 return Ok(None);
             }
         }
-        let start = self.block_offset_for(&self.index_entries, key);
+        let start = self.block_offset_for(&self.shared.index_entries, key);
         self.file.seek(SeekFrom::Start(start))?;
         loop {
             match self.read_record()? {
@@ -264,8 +289,8 @@ impl TableReader {
     /// Liefert alle Datensätze sortiert (genau `num_records` Stück).
     pub fn iter(&mut self) -> Result<Vec<(Vec<u8>, Entry)>> {
         self.file.seek(SeekFrom::Start(0))?;
-        let mut out = Vec::with_capacity(self.num_records as usize);
-        for _ in 0..self.num_records {
+        let mut out = Vec::with_capacity(self.shared.num_records as usize);
+        for _ in 0..self.shared.num_records {
             if let Some(rec) = self.read_record()? {
                 out.push(rec);
             } else {
@@ -291,11 +316,19 @@ pub struct TableIter {
 
 impl TableIter {
     pub fn open(path: &Path, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<TableIter> {
-        let mut reader = TableReader::open(path)?;
-        // Positioniere auf den Block, der `start` enthalten würde.
+        Self::from_reader(TableReader::open(path)?, start, end)
+    }
+
+    /// Baut aus einem (ggf. geforkten) Reader einen Iterator — ohne erneutes
+    /// Öffnen der Datei. Positioniert auf den Block von `start`.
+    pub fn from_reader(
+        mut reader: TableReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<TableIter> {
         let offset = match start {
-            Some(s) => reader.block_offset_for(&reader.index_entries, s),
-            None => reader.index_entries.first().map_or(0, |e| e.offset),
+            Some(s) => reader.block_offset_for(&reader.shared.index_entries, s),
+            None => reader.shared.index_entries.first().map_or(0, |e| e.offset),
         };
         reader.file.seek(SeekFrom::Start(offset))?;
         Ok(TableIter {

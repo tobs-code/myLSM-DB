@@ -232,9 +232,17 @@ impl Database {
         sources.push(Box::new(memtable_source(&self.memtable, start, end)));
         for level in &self.manifest.levels {
             for id in level.iter().rev() {
-                let path = self.table_path(*id);
-                let table = sstable::TableIter::open(&path, start, end)?;
-                sources.push(Box::new(table));
+                // Gecachte Reader wiederverwenden (Index/Bloom/Handle teilen),
+                // statt pro Scan jede Datei neu zu öffnen — sonst O(Tabellen) pro
+                // Scan und quadratisch über viele Puts.
+                if !self.table_cache.contains_key(id) {
+                    self.table_cache
+                        .insert(*id, sstable::TableReader::open(&self.table_path(*id))?);
+                }
+                let reader = self.table_cache.get(id).expect("cached").fork()?;
+                sources.push(Box::new(sstable::TableIter::from_reader(
+                    reader, start, end,
+                )?));
             }
         }
         let merge = MergeIter::new(sources);
@@ -512,6 +520,28 @@ mod tests {
             let expected = model_scan(&db, s, e);
             let actual = db.scan(s, e).unwrap();
             assert_eq!(actual, expected, "range {s:?}..{e:?}");
+        }
+    }
+
+    #[test]
+    fn scan_reuses_cached_table_readers() {
+        // Regression: scan_stream muss gecachte Reader wiederverwenden statt
+        // pro Scan jede Datei neu zu öffnen. Nach dem ersten Scan ist der Cache
+        // befüllt; weitere Scans dürfen die Cache-Größe nicht mehr wachsen lassen.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path()); // erzeugt 2 SSTables via flush
+        assert!(db.table_cache.is_empty(), "cache startet leer");
+        let expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = db.scan(None, None).unwrap();
+        let n = db.table_cache.len();
+        assert!(
+            n > 0 && n == db.table_count(),
+            "cache befüllt mit allen Tabellen ({n} vs {})",
+            db.table_count()
+        );
+        for _ in 0..3 {
+            let again = db.scan(None, None).unwrap();
+            assert_eq!(again, expected, "Ergebnis stabil über Scans");
+            assert_eq!(db.table_cache.len(), n, "keine neuen Reader nach 1. Scan");
         }
     }
 
