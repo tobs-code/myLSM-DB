@@ -67,6 +67,14 @@ pub struct EntityStore {
     db: Database,
     schema: Schema,
     schema_path: PathBuf,
+    /// Feld-Satz-Hint pro Entity (collection_id, entity_id) → Feld-IDs.
+    ///
+    /// **5a-Heuristik, nie Wahrheitsquelle.** Nur der nicht-transaktionale
+    /// `put_entity`-Pfad pflegt und konsultiert ihn; er wird beim Öffnen
+    /// verworfen (→ Cold-Scan) und nach Transaktions-Commit invalidiert.
+    /// Erlaubt im warmen Pfad gezielte Point-Lookups statt des vollständigen
+    /// Entity-Range-Scans (Read-Amplification v0.7-B).
+    field_hint: HashMap<(u32, Vec<u8>), HashSet<u32>>,
 }
 
 /// Ein Handle auf eine einzelne Collection, das `put`/`get`/`delete` auf
@@ -238,9 +246,17 @@ fn indexed_field_ids(schema: &Schema, collection_id: u32) -> Vec<u32> {
 /// 2. PUT Entity (neue Felder) / DELETE veraltete Entity-Felder
 /// 3. DELETE alter Index-Eintrag (erst wenn die Entity den Wert nicht mehr hat)
 /// ```
+///
+/// `hint` ist die 5a-Heuristik (siehe [`EntityStore::field_hint`]). `Some` nur
+/// im nicht-transaktionalen Pfad; bei vorhandenem Hint wird der bestehende
+/// Feldzustand über **gezielte Point-Lookups** statt über den vollständigen
+/// Entity-Range-Scan ermittelt. `None` (transaktional, unsicherer Zustand)
+/// erzwingt den sicheren Cold-Scan. Der Hint ist nie die Wahrheitsquelle: Ein
+/// fehlender Hint (z. B. nach Reopen) fällt auf den Scan zurück.
 fn core_put_entity(
     schema: &mut Schema,
     m: &mut impl Mutator,
+    mut hint: Option<&mut HashMap<(u32, Vec<u8>), HashSet<u32>>>,
     collection_id: u32,
     entity_id: &[u8],
     entity: &Entity,
@@ -253,54 +269,118 @@ fn core_put_entity(
     // nicht-transaktionaler Pfad), damit eine abgebrochene Transaktion kein
     // Schema schreibt, BEVOR sie committed ist.
     let mut written: Vec<(u32, &Value)> = Vec::with_capacity(entity.fields.len());
+    #[cfg(feature = "bench-diag")]
+    let t_fid = std::time::Instant::now();
     for (name, value) in &entity.fields {
         let field_id = schema.field_id(collection_id, name);
         written.push((field_id, value));
     }
+    #[cfg(feature = "bench-diag")]
+    if crate::diag::active() {
+        crate::diag::add_field_id_us(t_fid.elapsed().as_micros() as u64);
+    }
+
+    let new_ids: HashSet<u32> = written.iter().map(|(f, _)| *f).collect();
+    #[cfg(feature = "bench-diag")]
+    let t_idxf = std::time::Instant::now();
+    let indexed = indexed_field_ids(schema, collection_id);
+    #[cfg(feature = "bench-diag")]
+    if crate::diag::active() {
+        crate::diag::add_idx_fields_us(t_idxf.elapsed().as_micros() as u64);
+    }
 
     // Bisherige Felder der Entität ermitteln (für Stale-Removal + Index-Diff).
-    let (start, end) = keycodec::entity_range(collection_id, entity_id);
-    let existing: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
-        .scan(Some(&start), end.as_deref())?
-        .collect::<std::result::Result<_, _>>()?;
-    let mut old_values: HashMap<u32, Value> = HashMap::new();
-    for (key, value_opt) in &existing {
-        if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-            if let Some(v) = value_opt {
-                if let Ok(val) = codec::decode(v) {
-                    old_values.insert(field_id, val);
+    // Warm (Hint vorhanden): gezielte Point-Lookups der infrage kommenden Felder.
+    // Cold (kein Hint / unsicher): vollständiger Entity-Range-Scan.
+    let (old_values, stale_keys): (HashMap<u32, Value>, Vec<Vec<u8>>) = {
+        let mut old_values: HashMap<u32, Value> = HashMap::new();
+        let mut stale_keys: Vec<Vec<u8>> = Vec::new();
+        let mut cold = true;
+        if let Some(map) = hint.as_mut() {
+            let key = (collection_id, entity_id.to_vec());
+            if let Some(hinted) = map.get(&key).cloned() {
+                cold = false;
+                // Stale-Kandidaten: Felder, die die Entity lt. Hint hatte, jetzt
+                // aber nicht mehr geschrieben werden. Per Point-Lookup verifizieren.
+                for fid in hinted.difference(&new_ids).copied() {
+                    let k = keycodec::encode_entity_key(collection_id, entity_id, fid);
+                    if let Some(bytes) = m.get(&k)? {
+                        stale_keys.push(k);
+                        if indexed.contains(&fid) {
+                            if let Ok(v) = codec::decode(&bytes) {
+                                old_values.insert(fid, v);
+                            }
+                        }
+                    }
+                }
+                // Alte Werte indexierter geschriebener Felder (für den Index-Diff).
+                for (fid, _value) in &written {
+                    if !indexed.contains(fid) {
+                        continue;
+                    }
+                    let k = keycodec::encode_entity_key(collection_id, entity_id, *fid);
+                    if let Some(bytes) = m.get(&k)? {
+                        if let Ok(v) = codec::decode(&bytes) {
+                            old_values.insert(*fid, v);
+                        }
+                    }
                 }
             }
         }
-    }
+        if cold {
+            let (start, end) = keycodec::entity_range(collection_id, entity_id);
+            #[cfg(feature = "bench-diag")]
+            let t_scan = std::time::Instant::now();
+            let existing: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+                m.scan(Some(&start), end.as_deref())?
+                    .collect::<std::result::Result<_, _>>()?;
+            #[cfg(feature = "bench-diag")]
+            if crate::diag::active() {
+                crate::diag::add_scan_collect_us(t_scan.elapsed().as_micros() as u64);
+            }
+            for (key, value_opt) in &existing {
+                if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
+                    if !new_ids.contains(&field_id) {
+                        stale_keys.push(key.clone());
+                    }
+                    if let Some(v) = value_opt {
+                        if let Ok(val) = codec::decode(v) {
+                            old_values.insert(field_id, val);
+                        }
+                    }
+                }
+            }
+        }
+        (old_values, stale_keys)
+    };
 
     // 1) Neue Index-Einträge für geänderte/neu indexierte Felder schreiben
     //    (Bevor die Entity aktualisiert wird → kein False Negative).
-    let indexed = indexed_field_ids(schema, collection_id);
     for (field_id, value) in &written {
         if !indexed.contains(field_id) {
             continue;
         }
-        let changed = old_values.get(field_id) != Some(value);
+        let changed = old_values.get(field_id) != Some(*value);
         if changed {
+            #[cfg(feature = "bench-diag")]
+            let t_enc = std::time::Instant::now();
             let ik = keycodec::encode_index_key(
                 collection_id,
                 *field_id,
                 &ordering::encode_ordered(value),
                 entity_id,
             );
+            #[cfg(feature = "bench-diag")]
+            if crate::diag::active() {
+                crate::diag::add_idx_enc_us(t_enc.elapsed().as_micros() as u64);
+            }
             m.put(&ik, &[])?;
         }
     }
 
     // 2) Entity-Felder schreiben + veraltete entfernen.
-    let new_field_ids: HashSet<u32> = written.iter().map(|(f, _)| *f).collect();
-    for (key, _) in &existing {
-        if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-            if !new_field_ids.contains(&field_id) {
-                m.delete(key)?;
-            }
-        }
+    for key in &stale_keys {
+        m.delete(key)?;
     }
     for (field_id, value) in &written {
         let key = keycodec::encode_entity_key(collection_id, entity_id, *field_id);
@@ -326,6 +406,11 @@ fn core_put_entity(
             );
             m.delete(&ik)?;
         }
+    }
+
+    // Hint aktualisieren: Die Entity hat danach genau die geschriebenen Felder.
+    if let Some(map) = hint.as_mut() {
+        map.insert((collection_id, entity_id.to_vec()), new_ids);
     }
     Ok(())
 }
@@ -455,6 +540,7 @@ impl EntityStore {
             db,
             schema,
             schema_path,
+            field_hint: HashMap::new(),
         };
         // Noch nicht fertige Indizes (BUILDING nach einem Crash) neu aufbauen.
         store.recover_indexes()?;
@@ -538,12 +624,26 @@ impl EntityStore {
         entity_id: &[u8],
         entity: &Entity,
     ) -> Result<()> {
+        #[cfg(feature = "bench-diag")]
+        let t = std::time::Instant::now();
         {
             let schema = &mut self.schema;
             let mut m = DirectMutator { db: &mut self.db };
-            core_put_entity(schema, &mut m, collection_id, entity_id, entity)?;
+            core_put_entity(
+                schema,
+                &mut m,
+                Some(&mut self.field_hint),
+                collection_id,
+                entity_id,
+                entity,
+            )?;
         }
-        self.persist_schema()
+        self.persist_schema()?;
+        #[cfg(feature = "bench-diag")]
+        if crate::diag::active() {
+            crate::diag::add_entity_put_us(t.elapsed().as_micros() as u64);
+        }
+        Ok(())
     }
 
     /// Liest eine Entität vollständig aus ihren Feld-Keys und rekonstruiert sie.
@@ -559,6 +659,9 @@ impl EntityStore {
             let mut m = DirectMutator { db: &mut self.db };
             core_delete_entity(schema, &mut m, collection_id, entity_id)?;
         }
+        // Hint entfernen: die Entity existiert nicht mehr; ein späterer Put muss
+        // über den Cold-Scan den tatsächlichen (leeren) Zustand feststellen.
+        self.field_hint.remove(&(collection_id, entity_id.to_vec()));
         Ok(())
     }
 
@@ -644,7 +747,14 @@ impl<'a> Transaction<'a> {
             &mut self.pending,
         );
         let mut m = TxMutator { db, pending };
-        core_put_entity(schema, &mut m, collection_id, entity_id.as_bytes(), entity)
+        core_put_entity(
+            schema,
+            &mut m,
+            None,
+            collection_id,
+            entity_id.as_bytes(),
+            entity,
+        )
     }
 
     /// Löscht eine Entität innerhalb der Transaktion.
@@ -785,6 +895,14 @@ impl<'a> Transaction<'a> {
                 }
             }
             let _ = db.flush_if_over_limit();
+        }
+        // Transaktionale Writes gehen am Feld-Satz-Hint vorbei → Hint für die
+        // betroffenen Entities invalidieren (der nächste Put fällt auf den
+        // sicheren Cold-Scan zurück; der Hint ist nie die Wahrheitsquelle).
+        for key in self.pending.keys() {
+            if let Some((coll, eid, _fid)) = keycodec::decode_entity_key(key) {
+                self.store.field_hint.remove(&(coll, eid.to_vec()));
+            }
         }
         self.state = TxState::Committed;
         Ok(())
@@ -1303,5 +1421,190 @@ mod tests {
             .unwrap()
             .expect("exists");
         assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
+    }
+
+    /// Führt eine Update-Sequenz aus: anlegen, Feld hinzufügen+entfernen+ändern,
+    /// Feld entfernen. Bei `reopen_each = true` wird vor jedem Schritt neu
+    /// geöffnet (→ Feld-Satz-Hint ist nie gesetzt, reiner Cold-Scan-Pfad).
+    /// Dient als semantisches Oracle für den warmen Pfad (5a+2).
+    fn run_update_seq(dir: &std::path::Path, reopen_each: bool) -> Entity {
+        let mut store = EntityStore::open(dir).unwrap();
+        let mut e = user("Tobias", 31, true);
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        if reopen_each {
+            store.close().unwrap();
+            store = EntityStore::open(dir).unwrap();
+        }
+        // add + remove + change in einem Update
+        e.insert("city", Value::String("Berlin".into()));
+        e.fields.retain(|(n, _)| n != "active");
+        e.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(32);
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        if reopen_each {
+            store.close().unwrap();
+            store = EntityStore::open(dir).unwrap();
+        }
+        // city wieder entfernen (Stale-Removal über vorherigen Zustand)
+        e.fields.retain(|(n, _)| n != "city");
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
+        store.close().unwrap();
+        got
+    }
+
+    #[test]
+    fn warm_path_matches_cold_path_semantics() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let warm = run_update_seq(d1.path(), false);
+        let cold = run_update_seq(d2.path(), true);
+        assert_eq!(warm, cold);
+        assert_eq!(warm.field("age"), Some(&Value::Int(32)));
+        assert!(warm.field("active").is_none());
+        assert!(warm.field("city").is_none());
+        assert_eq!(warm.field("name"), Some(&Value::String("Tobias".into())));
+    }
+
+    #[test]
+    fn warm_update_adds_and_removes_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let mut col = store.collection("users").unwrap();
+        let mut e = user("Tobias", 31, true);
+        col.put("u1", &e).unwrap();
+        // add + remove + change (warm: gleiche Session, Hint vorhanden)
+        e.insert("city", Value::String("Berlin".into()));
+        e.fields.retain(|(n, _)| n != "active");
+        e.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(32);
+        col.put("u1", &e).unwrap();
+        let got = col.get("u1").unwrap().expect("exists");
+        assert_eq!(got.field("age"), Some(&Value::Int(32)));
+        assert_eq!(got.field("city"), Some(&Value::String("Berlin".into())));
+        assert!(
+            got.field("active").is_none(),
+            "stale field must be removed (warm)"
+        );
+        assert_eq!(got.field("name"), Some(&Value::String("Tobias".into())));
+    }
+
+    #[test]
+    fn index_diff_on_warm_update_change_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .create_index("age")
+            .unwrap();
+        let e1 = user("Tobias", 31, true);
+        store.collection("users").unwrap().put("u1", &e1).unwrap();
+        assert_eq!(
+            ids(store
+                .collection("users")
+                .unwrap()
+                .find("age", FindOp::Eq(Value::Int(31)))
+                .unwrap()),
+            vec!["u1"]
+        );
+        // Warm-Update: age ändern → alter Index-Eintrag muss weg.
+        let mut e2 = e1.clone();
+        e2.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(32);
+        store.collection("users").unwrap().put("u1", &e2).unwrap();
+        assert!(
+            store
+                .collection("users")
+                .unwrap()
+                .find("age", FindOp::Eq(Value::Int(31)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(store
+                .collection("users")
+                .unwrap()
+                .find("age", FindOp::Eq(Value::Int(32)))
+                .unwrap()),
+            vec!["u1"]
+        );
+    }
+
+    #[test]
+    fn update_across_flush_removes_stale_from_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let mut e = user("Tobias", 31, true);
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        store.flush().unwrap(); // Feld liegt jetzt in einer SSTable
+        // Warm-Update entfernt ein Feld, das bereits geflusht ist.
+        e.fields.retain(|(n, _)| n != "active");
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
+        assert!(
+            got.field("active").is_none(),
+            "stale field in SSTable must be removed"
+        );
+    }
+
+    #[test]
+    fn cold_start_update_removes_stale_field() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = EntityStore::open(dir.path()).unwrap();
+            let e = user("Tobias", 31, true);
+            store.collection("users").unwrap().put("u1", &e).unwrap();
+            store.flush().unwrap();
+            store.close().unwrap();
+        }
+        // Reopen → Hint leer → Cold-Scan muss Stale-Feld trotzdem entfernen.
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let mut e = user("Tobias", 31, true);
+        e.fields.retain(|(n, _)| n != "active");
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
+        assert!(
+            got.field("active").is_none(),
+            "cold start must remove stale field"
+        );
+    }
+
+    #[test]
+    fn tx_commit_invalidates_field_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EntityStore::open(dir.path()).unwrap();
+        let e = user("Tobias", 31, true);
+        store.collection("users").unwrap().put("u1", &e).unwrap();
+        // Transaktion ändert die Entity (geht an Store-Hint vorbei) → Hint muss
+        // danach invalidiert sein, sonst wäre die folgende Non-Tx-Put unsicher.
+        let mut e2 = e.clone();
+        e2.fields.retain(|(n, _)| n != "active");
+        store
+            .transaction_with(|tx| {
+                tx.update("users", "u1", &e2)?;
+                Ok(())
+            })
+            .unwrap();
+        // Entferntes Feld darf nicht wieder auftauchen.
+        let got = store
+            .collection("users")
+            .unwrap()
+            .get("u1")
+            .unwrap()
+            .expect("exists");
+        assert!(got.field("active").is_none());
     }
 }
