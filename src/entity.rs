@@ -26,7 +26,7 @@ use crate::keycodec;
 use crate::ordering;
 use crate::query::{self, QueryBuilder};
 use crate::schema::{IndexStatus, Schema};
-use crate::{Database, DirectMutator, Mutator, ScanStream};
+use crate::{Database, DirectMutator, Mutator, Options, ScanStream};
 
 /// Eine rekonstruierte Entität: eine (geordnete) Liste benannter getypter Werte.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -75,6 +75,18 @@ pub struct EntityStore {
     /// Erlaubt im warmen Pfad gezielte Point-Lookups statt des vollständigen
     /// Entity-Range-Scans (Read-Amplification v0.7-B).
     field_hint: HashMap<(u32, Vec<u8>), HashSet<u32>>,
+    /// **Prototyp v0.7-write-cache, Variante A** (nur mit `bench-diag`):
+    /// Alter-Wert-Cache indexierter Felder pro Entity — `(collection_id,
+    /// entity_id)` → `field_id → Value`.
+    ///
+    /// Nie eine Wahrheitsquelle: Er wird nur vom nicht-transaktionalen
+    /// `put_entity`-Pfad write-through befüllt und konsultiert; bei
+    /// Cache-Miss wird exakt der bestehende Point-Lookup (`Mutator::get`)
+    /// verwendet. Reopen leert ihn; Delete/Transaktions-Commit invalidieren
+    /// die betroffenen Entities. Wird der Prototyp verworfen, entfernt dieses
+    /// Feld samt Pfad im Release-Build jeden Overhead.
+    #[cfg(feature = "bench-diag")]
+    value_cache: HashMap<(u32, Vec<u8>), HashMap<u32, Value>>,
 }
 
 /// Ein Handle auf eine einzelne Collection, das `put`/`get`/`delete` auf
@@ -257,6 +269,8 @@ fn core_put_entity(
     schema: &mut Schema,
     m: &mut impl Mutator,
     mut hint: Option<&mut HashMap<(u32, Vec<u8>), HashSet<u32>>>,
+    #[cfg(feature = "bench-diag")]
+    mut value_cache: Option<&mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>>,
     collection_id: u32,
     entity_id: &[u8],
     entity: &Entity,
@@ -298,11 +312,26 @@ fn core_put_entity(
         let mut cold = true;
         if let Some(map) = hint.as_mut() {
             let key = (collection_id, entity_id.to_vec());
-            if let Some(hinted) = map.get(&key).cloned() {
+            // Prototyp: gecachte alte Werte indexierter Felder dieser Entity.
+            #[cfg(feature = "bench-diag")]
+            let cached_values: HashMap<u32, Value> = value_cache
+                .as_mut()
+                .map_or(HashMap::new(), |m| m.get(&key).cloned().unwrap_or_default());
+            #[cfg(feature = "bench-diag")]
+            let t_hint = std::time::Instant::now();
+            let hint_hit = map.get(&key).cloned();
+            let stale_cands: Vec<u32> = hint_hit
+                .as_ref()
+                .map_or(Vec::new(), |h| h.difference(&new_ids).copied().collect());
+            #[cfg(feature = "bench-diag")]
+            if crate::diag::active() {
+                crate::diag::add_put_hint_us(t_hint.elapsed().as_micros() as u64);
+            }
+            if hint_hit.is_some() {
                 cold = false;
                 // Stale-Kandidaten: Felder, die die Entity lt. Hint hatte, jetzt
                 // aber nicht mehr geschrieben werden. Per Point-Lookup verifizieren.
-                for fid in hinted.difference(&new_ids).copied() {
+                for fid in stale_cands {
                     let k = keycodec::encode_entity_key(collection_id, entity_id, fid);
                     if let Some(bytes) = m.get(&k)? {
                         stale_keys.push(k);
@@ -314,8 +343,16 @@ fn core_put_entity(
                     }
                 }
                 // Alte Werte indexierter geschriebener Felder (für den Index-Diff).
+                // Prototyp: Cache-Hit liefert den Wert ohne Disk-Read (→ get_us ≈ 0);
+                // Cache-Miss fällt exakt auf den bestehenden Point-Lookup zurück.
                 for (fid, _value) in &written {
                     if !indexed.contains(fid) {
+                        continue;
+                    }
+                    #[cfg(feature = "bench-diag")]
+                    if let Some(v) = cached_values.get(fid) {
+                        old_values.insert(*fid, v.clone());
+                        crate::diag::add_cache_hit();
                         continue;
                     }
                     let k = keycodec::encode_entity_key(collection_id, entity_id, *fid);
@@ -324,6 +361,8 @@ fn core_put_entity(
                             old_values.insert(*fid, v);
                         }
                     }
+                    #[cfg(feature = "bench-diag")]
+                    crate::diag::add_cache_miss();
                 }
             }
         }
@@ -384,7 +423,13 @@ fn core_put_entity(
     }
     for (field_id, value) in &written {
         let key = keycodec::encode_entity_key(collection_id, entity_id, *field_id);
+        #[cfg(feature = "bench-diag")]
+        let t_enc = std::time::Instant::now();
         let enc = codec::encode(value);
+        #[cfg(feature = "bench-diag")]
+        if crate::diag::active() {
+            crate::diag::add_put_fieldenc_us(t_enc.elapsed().as_micros() as u64);
+        }
         m.put(&key, &enc)?;
     }
 
@@ -411,6 +456,19 @@ fn core_put_entity(
     // Hint aktualisieren: Die Entity hat danach genau die geschriebenen Felder.
     if let Some(map) = hint.as_mut() {
         map.insert((collection_id, entity_id.to_vec()), new_ids);
+    }
+    // Prototyp: Alte Werte indexierter Felder write-through aktualisieren. Die
+    // Entity besitzt danach genau die geschriebenen indexierten Feldwerte; ein
+    // späteres Update kann sie direkt für den Index-Diff nutzen (kein Disk-Read).
+    // Entfernte Felder fallen automatisch heraus (whole-map-Ersetzung).
+    #[cfg(feature = "bench-diag")]
+    if let Some(map) = value_cache.as_mut() {
+        let new_values: HashMap<u32, Value> = written
+            .iter()
+            .filter(|(f, _)| indexed.contains(f))
+            .map(|&(f, v)| (f, v.clone()))
+            .collect();
+        map.insert((collection_id, entity_id.to_vec()), new_values);
     }
     Ok(())
 }
@@ -532,8 +590,14 @@ impl EntityStore {
     /// Öffnet (oder erstellt) einen Entitäts-Store in `dir`. Legt darunter eine
     /// v0.1-KV-Engine an und lädt das persistente Schema.
     pub fn open(dir: impl AsRef<std::path::Path>) -> Result<EntityStore> {
+        Self::open_with(dir, Options::default())
+    }
+
+    /// Öffnet (oder erstellt) einen Entitäts-Store mit angepassten Engine-Optionen
+    /// (z. B. größere MemTable-Limits für Diagnose-/Benchmark-Zwecke).
+    pub fn open_with(dir: impl AsRef<std::path::Path>, opts: Options) -> Result<EntityStore> {
         let dir = dir.as_ref();
-        let db = Database::open(dir)?;
+        let db = Database::open_with(dir, opts)?;
         let schema_path = dir.join("SCHEMA");
         let schema = Schema::load(&schema_path)?;
         let mut store = EntityStore {
@@ -541,6 +605,8 @@ impl EntityStore {
             schema,
             schema_path,
             field_hint: HashMap::new(),
+            #[cfg(feature = "bench-diag")]
+            value_cache: HashMap::new(),
         };
         // Noch nicht fertige Indizes (BUILDING nach einem Crash) neu aufbauen.
         store.recover_indexes()?;
@@ -633,6 +699,8 @@ impl EntityStore {
                 schema,
                 &mut m,
                 Some(&mut self.field_hint),
+                #[cfg(feature = "bench-diag")]
+                Some(&mut self.value_cache),
                 collection_id,
                 entity_id,
                 entity,
@@ -662,6 +730,9 @@ impl EntityStore {
         // Hint entfernen: die Entity existiert nicht mehr; ein späterer Put muss
         // über den Cold-Scan den tatsächlichen (leeren) Zustand feststellen.
         self.field_hint.remove(&(collection_id, entity_id.to_vec()));
+        #[cfg(feature = "bench-diag")]
+        self.value_cache
+            .remove(&(collection_id, entity_id.to_vec()));
         Ok(())
     }
 
@@ -750,6 +821,8 @@ impl<'a> Transaction<'a> {
         core_put_entity(
             schema,
             &mut m,
+            None,
+            #[cfg(feature = "bench-diag")]
             None,
             collection_id,
             entity_id.as_bytes(),
@@ -902,6 +975,8 @@ impl<'a> Transaction<'a> {
         for key in self.pending.keys() {
             if let Some((coll, eid, _fid)) = keycodec::decode_entity_key(key) {
                 self.store.field_hint.remove(&(coll, eid.to_vec()));
+                #[cfg(feature = "bench-diag")]
+                self.store.value_cache.remove(&(coll, eid.to_vec()));
             }
         }
         self.state = TxState::Committed;

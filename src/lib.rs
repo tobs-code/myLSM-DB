@@ -1,5 +1,7 @@
 pub mod codec;
 pub mod compaction;
+#[cfg(feature = "bench-diag")]
+pub mod diag;
 pub mod entity;
 pub mod error;
 pub mod index;

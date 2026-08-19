@@ -3,6 +3,12 @@ name = "my-lsm-db"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Diagnose-Instrumentierung für Benchmark/Analyse. Nur aktiv, wenn der
+# Benchmark mit `--features bench-diag` gebaut wird; im normalen Release-Pfad
+# ist keiner der Counter überhaupt einkompiliert.
+bench-diag = []
+
 [dependencies]
 crc32fast = "1.4"
 
