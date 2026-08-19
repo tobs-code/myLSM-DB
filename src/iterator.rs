@@ -157,17 +157,31 @@ impl MergeIter {
     }
 }
 
-/// Die (beschränkte) MemTable-Kopie, konvertiert in eine Lazy-Quelle.
+/// Die MemTable als Quelle, konvertiert in einen Vektor.
+///
+/// Materialisiert **nur** den angefragten Bereich `[start, end)` (via lazy
+/// `BTreeMap::range`) statt der gesamten MemTable — sonst wäre jeder Scan
+/// O(MemTable) und ein Put mit vorgeschaltetem Scan würde quadratisch werden.
 pub fn memtable_source(
     memtable: &crate::memtable::MemTable,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
 ) -> VecSource {
+    use std::ops::Bound;
+    // Ein leeres [start, end)-Intervall darf nicht an BTreeMap::range gehen
+    // (das panickt bei start > end); Rückgabe einer leeren Quelle.
+    if let (Some(s), Some(e)) = (start, end) {
+        if s >= e {
+            return VecSource::new(Vec::new());
+        }
+    }
+    let start = start.map_or(Bound::Unbounded, |s| Bound::Included(s.to_vec()));
+    let end = end.map_or(Bound::Unbounded, |e| Bound::Excluded(e.to_vec()));
     let items: Vec<(Vec<u8>, Entry)> = memtable
-        .iter()
+        .range(start, end)
         .map(|(k, v)| (k.to_vec(), v.clone()))
         .collect();
-    VecSource::subrange(items, start, end)
+    VecSource::new(items)
 }
 
 /// Mergt mehrere bereits materialisierte, sortierte Vektoren (z.B. für die
@@ -299,5 +313,51 @@ mod tests {
     fn empty_sources() {
         let out = drain(MergeIter::new(vec![src(vec![]), src(vec![])]));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn memtable_source_materializes_only_range() {
+        use crate::memtable::MemTable;
+        let mut m = MemTable::new();
+        for k in ["a", "b", "c", "d", "e", "f"] {
+            m.put(k.as_bytes().to_vec(), Some(format!("v-{k}").into_bytes()));
+        }
+        // [b, e) → nur b, c, d.
+        let out: Vec<Vec<u8>> = memtable_source(&m, Some(b"b"), Some(b"e"))
+            .items
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(out, vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[test]
+    fn memtable_source_empty_range_returns_empty() {
+        // Regression: start >= end durfte früher an BTreeMap::range gehen und
+        // dort panicken; jetzt muss eine leere Quelle zurückkommen.
+        use crate::memtable::MemTable;
+        let mut m = MemTable::new();
+        for k in ["a", "b", "c"] {
+            m.put(k.as_bytes().to_vec(), Some(k.as_bytes().to_vec()));
+        }
+        let out = memtable_source(&m, Some(b"z"), Some(b"a")).items;
+        assert!(out.is_empty());
+        let out = memtable_source(&m, Some(b"b"), Some(b"b")).items;
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn memtable_source_unbounded_returns_all() {
+        use crate::memtable::MemTable;
+        let mut m = MemTable::new();
+        for k in ["a", "b", "c"] {
+            m.put(k.as_bytes().to_vec(), Some(k.as_bytes().to_vec()));
+        }
+        let out: Vec<Vec<u8>> = memtable_source(&m, None, None)
+            .items
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(out, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
     }
 }
