@@ -692,3 +692,45 @@ Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist i
 - Nächster Sprint erst bei **neuem konkreten Befund**, nicht vorab als "v0.11" deklariert.
 - Vorgänger-Working-Tree (modifizierte `src/`-Dateien, temporäre Artefakte) bleibt bewusst unangetastet.
 
+---
+
+## Produktions-Handover-Checkpoint — `0e62b6e` (2026-08-20)
+
+> Abschluss der Correctness-/Recovery-/GC-/Durability-Diagnose. **Kein offener
+> technischer Arbeitsauftrag.** Nächster Zweig ausschließlich bei neuem realem
+> Befund. `0e62b6e` ist die **aktuelle Code-Baseline** (superseded `d6d5916`
+> für die aktive Linie) und == `origin/main`.
+
+**Kanonische Details:** `design-v0.7-compaction-v2.md` §30.9–§30.12.
+
+**Abgeschlossene Zweige (Design-Doc + Commit-History nachvollziehbar):**
+- **E.8** — Compaction-Correctness: `merge_ids`/`table_bounds` propagieren
+  Lese-/Iter-Fehler; `compact()` bricht vor `manifest.save` ab statt stillen
+  Datenverlusts. (`e9a5f80`, `tests/merge_ids_fault.rs`)
+- **E.10** — Orphan-GC: `db.gc()` (explizit, `&mut self`, **kein** Auto-GC beim
+  Open) räumt unreferenzierte `*.sst` + `.manifest.tmp` auf.
+  (`33b6a98` + `5ebc9ce`, `tests/orphan_gc.rs`)
+- **F.3–F.5** — Manifest-`L`-Zeilen-Parsing strikt: korrupter ID-Token in
+  `L`-Zeile → `InvalidFormat` statt stillem Datenverlust.
+  (`0725057`, `tests/manifest_corruption.rs`)
+- **F-WAL** — WAL-Durability-Audit: kein Correctness-Bug, kein
+  Vertragsbruch; deferred durability explizit dokumentiert. (`0e62b6e`, §30.12)
+
+**Bewusste Designentscheidungen (kein Fix nötig):**
+- Direct `put`/`delete`: **deferred durability** — nicht durable beim Return,
+  durable nach `flush()`/`close()`. Transaktionen durable nach `commit()`
+  (per-commit `fsync`). **Kein** `fsync` pro Direct-Write ( Performance-/Architektur-Entscheidung, kein Bug).
+- `MANIFEST` atomar (tmp + `sync_all` + rename); `L0`/Segmente werden vor
+  deren Löschung committet (Crash-Fenster erzeugen nur harmlose Orphans).
+- `merge_ids`/`table_bounds` brechen bei unlesbarer manifestierter SSTable ab
+  (kein stiller Datenverlust mehr).
+- `gc()` nur explizit, id-basiert; rührt Manifest/Compaction nicht an.
+
+**Offene Befunde:** **keine** A/B-Correctness-/Durability-Befunde. Performance-
+Themen (WAL-fsync, Reader-Cache, Compaction-Strategie) bewusst nicht
+angetastet — kein nachgewiesener Nutzen.
+
+**Regel:** Kein neuer technischer Zweig ohne konkreten neuen Befund. Bei realem
+Workload (get / Entity-Put / Compaction / Speicherverbrauch) startet daraus der
+nächste Zyklus: **Befund → Forensik → Regression → minimaler Fix → Volltest → Push.**
+
