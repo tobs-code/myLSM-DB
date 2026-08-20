@@ -29,7 +29,3 @@ required-features = ["bench-diag"]
 [[example]]
 name = "bench-v9b"
 required-features = ["bench-diag"]
-
-[[example]]
-name = "bench-v2"
-required-features = ["bench-diag"]

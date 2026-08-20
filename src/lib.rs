@@ -463,7 +463,7 @@ impl Database {
             return Ok(());
         }
         let (batch_min, batch_max) = self
-            .table_bounds(&l0)
+            .table_bounds(&l0)?
             .ok_or_else(|| crate::error::Error::Corrupt("empty L0 table in compact"))?;
 
         // Überlappende Segmente mergen, Rest behalten.
@@ -544,11 +544,12 @@ impl Database {
         let mut sources = Vec::new();
         for id in ids {
             let path = self.table_path(*id);
-            if let Ok(mut reader) = sstable::TableReader::open(&path) {
-                if let Ok(records) = reader.iter() {
-                    sources.push(records);
-                }
-            }
+            // Manifestierte SSTable muss lesbar sein: Ein Lesefehler (fehlende
+            // oder korrupte Datei) bricht die Compaction ab, statt die Tabelle
+            // still zu ueberspringen und Daten zu verlieren (E.8).
+            let mut reader = sstable::TableReader::open(&path)?;
+            let records = reader.iter()?;
+            sources.push(records);
         }
         let mut merged = merge_vecs(sources)?;
         if drop_tombstones {
@@ -558,28 +559,30 @@ impl Database {
     }
 
     /// `[min_key, max_key]`-Span ueber mehrere Tabellen (erste/letzte Index-Keys).
-    fn table_bounds(&self, ids: &[u64]) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn table_bounds(&self, ids: &[u64]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut min: Option<Vec<u8>> = None;
         let mut max: Option<Vec<u8>> = None;
         for id in ids {
             let path = self.table_path(*id);
-            if let Ok(reader) = sstable::TableReader::open(&path) {
-                if let Some((first, last)) = reader.key_bounds() {
-                    let f = first.to_vec();
-                    let l = last.to_vec();
-                    if min.as_ref().map_or(true, |m| f < *m) {
-                        min = Some(f);
-                    }
-                    if max.as_ref().map_or(true, |m| l > *m) {
-                        max = Some(l);
-                    }
-                }
+            // Wie `merge_ids`: Eine unlesbare Tabelle darf die Compaction nicht
+            // still fortschreiten lassen (E.8).
+            let reader = sstable::TableReader::open(&path)?;
+            let (first, last) = reader
+                .key_bounds()
+                .ok_or_else(|| crate::error::Error::Corrupt("empty L0 table referenced in compact"))?;
+            let f = first.to_vec();
+            let l = last.to_vec();
+            if min.as_ref().map_or(true, |m| f < *m) {
+                min = Some(f);
+            }
+            if max.as_ref().map_or(true, |m| l > *m) {
+                max = Some(l);
             }
         }
-        match (min, max) {
+        Ok(match (min, max) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
-        }
+        })
     }
 
     /// Schreibt eine neue SSTable mit frischer ID und gibt die ID zurück.

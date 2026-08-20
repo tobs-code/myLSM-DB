@@ -102,6 +102,7 @@ fn mk_db(dir: &Path) -> Database {
         Options {
             memtable_limit: 8 * 1024 * 1024,
             l0_compact_threshold: 4,
+            ..Default::default()
         },
     )
     .expect("open db")

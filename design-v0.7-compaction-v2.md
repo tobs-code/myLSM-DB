@@ -189,10 +189,20 @@ Crash-Punkte (unveraendert gultig):
   referenziert, im Recovery nicht geladen); alter Zustand bleibt konsistent.
 - Crash nach Manifest-Commit, vor Datei-Loeschung: Manifest zeigt auf die neuen
   Tables; alte Dateien sind verwaist, aber harmlos.
-- Kein Fall, in dem das Manifest auf eine nicht-existente Datei zeigt.
+- Kein Fall, in dem das Manifest auf eine nicht-existente Datei zeigt — **fuer
+  die drei obigen Crash-Fenster**. Die Atomicity-Garantie gilt nur zwischen
+  `sync_all` der neuen Tables und deren Manifest-COMMIT sowie zwischen COMMIT
+  und Loeschung der alten Dateien.
 
 Zusaetzlich fuer v2: Die **Segment-Ranges** muessen im Manifest-COMMIT atomar
 mitpersistiert werden (der Table-Satz und seine Ranges sind eine Einheit).
+
+**Correctness-Nachlese (siehe §30.9 / E.6–E.8):** Diese Invariante deckt
+ausschliesslich Crash-Punkte ab. Eine waerend des Betriebs unlesbar werdende,
+bereits **manifestierte** SSTable (extern geloescht/korrupt) ist eine andere
+Fehlerklasse: Vor E.8 hat `merge_ids` sie still uebersprungen → stiller
+Datenverlust; seit E.8 bricht `compact()` mit `Err` ab und committet nicht
+(siehe §30.9).
 
 ## 5. Vergleichstabelle
 
@@ -418,7 +428,11 @@ Die drei Fenster bleiben verbindlich; mit Segmenten konkretisiert:
    → Recovery darf ausschliesslich den neuen Segmentzustand verwenden.
 
 Kein Fall, in dem das Manifest auf eine fehlende Datei oder eine falsche
-Range zeigt (§12.3 fangt das als harte Corrupt-Signatur ab).
+Range zeigt (§12.3 fangt das als harte Corrupt-Signatur ab) — **fuer die drei
+Crash-Fenster**. Eine zur *Laufzeit* unlesbar werdende, bereits manifestierte
+SSTable ist davon nicht erfasst: bis E.8 führte das zu stillem Datenverlust
+(`merge_ids` schluckte den Lesefehler), seit E.8 bricht `compact()` mit `Err`
+ab und committet nicht (siehe §30.9).
 
 ## 14. Definition of Done (messbar, vor Implementierung)
 
@@ -2108,5 +2122,79 @@ nicht die bloße Neugier auf eine Optimierung.
 
 **Diagnose-Freeze: §30 Compaction-fsync diagnosis complete; no production
 optimization justified under current defaults.**
+
+---
+
+### 30.9 Correctness-Nachlese — Compaction-Recovery (E.6–E.8)
+
+Die Performance-Diagnose (§30.1–§30.8) war ein **Diagnose-Freeze ohne
+Produktionsaenderung**. Im Anschluss wurde die Compaction-Recovery isoliert
+getestet (Phase E) und ein echter Correctness-Bug reproduziert.
+
+**E.6 — Ursprüngliche Recovery-Invariante (Annahme):**
+Die harte Invariante (§4, §13) besagt, dass das Manifest nie auf eine
+nicht-existierende Datei zeigt. Dies gilt fuer die drei Crash-Fenster
+(Atomicity durch tmp+fsync+rename). Die (falsche) Schlussfolgerung war, dass
+eine manifestierte SSTable damit immer verlässlich lesbar sei — also müsse ein
+Lesefehler beim Merge kein Datenverlustrisiko bergen.
+
+**E.7 — Gegenbeweis (reproduzierter Datenverlust):**
+Ein Test (`tests/merge_ids_fault.rs`, Vorzustand) loescht waehrend des
+Betriebs gezielt eine manifestierte Segment-Datei und loest eine Compaction
+aus, deren Batch-Span das Segment ueberlappt. Befund: `merge_ids`
+(`src/lib.rs`) nutzte `if let Ok(reader)` / `if let Ok(records)` und
+uebersprang die unlesbare Tabelle **still**. Das neue Manifest referenzierte
+die Daten nicht mehr → der Key (der NUR in dieser Tabelle lag) war spurlos
+verschwunden (`get` lieferte `None`). Zweiter Defekt: Bei cold-Open einer
+solchen DB warf `get` einen harten `NotFound`-Io-Fehler, weil
+`validate_open_state` nur Ranges, nicht die Dateiexistenz pruefte.
+
+**E.8 — Fehlerpropagierung behebt den Commit-Pfad:**
+- `merge_ids` und `table_bounds` propagieren den `open`/Lese-Fehler via `?`
+  statt ihn zu schlucken.
+- `compact()` bricht bei unlesbarer manifestierter SSTable mit `Err` ab. Da
+  `merge_ids` **vor** `manifest.save()` aufgerufen wird, bleibt der alte
+  Zustand (Manifest + alte `.sst`) vollständig erhalten — **kein stiller
+  Commit, kein Datenverlust-Commit**.
+- `validate_open_state` pruefte fehlende Segmentdateien bereits
+  (`Error::Corrupt`); ein cold-open liefert damit sauber `Corrupt` statt eines
+  späteren `NotFound` aus `get`.
+
+**Explizite Korrektur der bisherigen Aussage:**
+- `compact()` darf bei einer unlesbaren manifestierten SSTable **nicht
+  erfolgreich committen** (seit E.8 erfüllt).
+- Cold-Open mit fehlender Manifest-SSTable wird als `Error::Corrupt`
+  behandelt (keine stillschweigende Reparatur).
+- Die Atomicity-Invariante (§4/§13) gilt unveraendert fuer die drei
+  Crash-Fenster; sie deckt aber **nicht** eine zur Laufzeit unlesbar werdende
+  manifestierte SSTable ab — das ist seit E.8 ein bewusst fehlerhafter
+  (abbrechender) Pfad, kein stiller Datenverlust mehr.
+
+**Offen (bewusst nicht in E.8 behoben):**
+- Orphan-Garbage: physisch nicht mehr vom Manifest referenzierte `.sst`
+  werden nicht automatisch geloescht. Das ist Betriebs-/Speicherwartung, kein
+  Datenverlust, und wird separat als eigenes Audit bewertet (siehe unten).
+
+**Status:** E.8 ist der minimale Correctness-Fix; `tests/merge_ids_fault.rs`
+ist der permanente Regressionstest. Vollständige Test-Suite (`cargo test
+--release`) sowie `tests/crash.rs` (Crash-Matrix) gruen. Der Fix wird
+gemeinsam mit dieser Dokumentation in einem separaten Commit eingefroren.
+Die Performance-Diagnose (§30.8) bleibt unveraendert bestehen.
+
+### 30.10 Orphan-GC — separates Audit (noch nicht implementiert)
+
+Qualitativ anders als E.8: kein Datenverlust, sondern
+Speicher-/Betriebswartung. Vor einer etwaigen Implementierung ist nur zu
+klaeren (kein Code):
+
+- Welche Dateien duerfen ueberhaupt als Orphans gelten?
+- Wie erkennt man sicher, dass eine `.sst` nicht mehr vom aktuellen Manifest
+  referenziert wird?
+- Was passiert bei Crash genau zwischen Rename und Cleanup?
+- Darf GC beim Open automatisch loeschen oder braucht es einen expliziten
+  Maintenance-Schritt?
+- Welche Recovery-Semantik gilt fuer `.manifest.tmp`?
+
+Erst danach entscheiden, ob sich ein GC-Prototyp lohnt.
 
 **Kein Commit. Kein Produktionscode geändert.**
