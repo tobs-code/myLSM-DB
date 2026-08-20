@@ -11,6 +11,7 @@ pub mod ordering;
 pub mod query;
 pub mod schema;
 pub mod sstable;
+pub mod version;
 pub mod wal;
 
 use std::collections::HashMap;
@@ -65,6 +66,9 @@ pub struct Database {
     table_cache: HashMap<u64, sstable::TableReader>,
     /// Nächste frei zu vergebende Transaktions-ID (nie wiederverwendet).
     next_tx_id: u64,
+    /// Beim Öffnen ermittelte Format-Version der Datenbank
+    /// (`1` für Legacy-DBs ohne `VERSION`-Datei).
+    format_version: u32,
 }
 
 impl Database {
@@ -79,6 +83,27 @@ impl Database {
         std::fs::create_dir_all(&dir)?;
         let wal_path = dir.join("wal.log");
         let manifest_path = dir.join("MANIFEST");
+
+        // v0.9: DB-weiter Format-Versionierungsvertrag. Die `VERSION`-Datei ist
+        // die alleinige autoritative Quelle für die Format-Familie.
+        let format_version = match version::read_version(&dir) {
+            Ok(Some(v)) => {
+                version::check_compatible(v)?;
+                v
+            }
+            Ok(None) => {
+                if !manifest_path.exists() {
+                    // Frisch erzeugte DB: aktuelle Version dauerhaft schreiben.
+                    version::write_version(&dir, version::FORMAT_VERSION)?;
+                    version::FORMAT_VERSION
+                } else {
+                    // Legacy-v1-DB ohne `VERSION`: als v1 behandeln, nicht
+                    // umschreiben (bestehende Datenbanken bleiben lesbar).
+                    1
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let manifest = Manifest::load(&manifest_path)?;
         // Rekonstruiere eine frische Manifest-Struktur bis zur maximalen Levelhöhe.
@@ -100,6 +125,7 @@ impl Database {
             closed: false,
             table_cache: HashMap::new(),
             next_tx_id: 0,
+            format_version,
         };
 
         // Manifest-Reconstruction (§12.3): Legacy-L1-Konvertierung + harte
@@ -676,6 +702,14 @@ impl Database {
 
     pub fn level_count(&self) -> usize {
         self.manifest.levels.len()
+    }
+
+    /// Die beim Öffnen ermittelte Format-Version der Datenbank.
+    ///
+    /// `1` für Legacy-Datenbanken ohne `VERSION`-Datei; die geschriebene
+    /// Version für alle ab v0.9 erzeugten Datenbanken.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
     }
 
     pub fn level_tables(&self, level: usize) -> usize {

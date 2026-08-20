@@ -665,6 +665,11 @@ impl EntityStore {
         self.db.flush()
     }
 
+    /// Die beim Öffnen ermittelte Format-Version der Datenbank.
+    pub fn format_version(&self) -> u32 {
+        self.db.format_version()
+    }
+
     /// Scannt alle Entities einer Collection. (Auch als Oracle für Tests.)
     pub fn scan_collection(&mut self, name: &str) -> Result<Vec<(String, Entity)>> {
         let Some(collection_id) = self.schema.lookup_collection_id(name) else {
