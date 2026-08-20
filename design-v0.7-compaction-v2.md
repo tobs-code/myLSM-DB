@@ -1884,5 +1884,56 @@ historischen Bench-Harnesse (Klasse C) rechtfertigen keinen weiteren Sprint.
 
 **Damit ist der Handover von der Vorgänger-Arbeit abgeschlossen.** Eigene
 Diagnose (§23–§26) und übernommene Vorgänger-Arbeit sind sauber voneinander
+
+## §29 Phase C — Produktionsänderungen auditieren (Abschluss)
+
+Nach §27/§28 wurde der verbleibende uncommittete Vorgänger-Working-Tree
+(Phase C.1 Inventar) vollständig klassifiziert. Ergebnis: **es gibt keine
+unbewertete produktive Logikänderung** jenseits dessen, was bereits in §27/§28
+bewertet wurde.
+
+### 29.1 Echte (non-whitespace) Diffs vs d6d5916 — Produktionscode
+
+| Datei | Echte Diff-Zeilen | Logikänderung? |
+|-------|------------------:|----------------|
+| `src/lib.rs` | 11 | Nein — nur `mod diag;` (Audit-Hilfe) + rustfmt |
+| `src/entity.rs` | 5 | Nein — nur gated `value_cache`-Parameter (§27) + rustfmt |
+| `src/manifest.rs` | 16 | Nein — nur rustfmt |
+| `src/diag.rs` | 103 | Neue Datei, aber Diagnose-Infrastruktur (§28 Klasse B) |
+| `src/bin/crash_tester.rs` | 8 | Nein — nur rustfmt |
+| `src/wal.rs` | 0 | **Unverändert** vs d6d5916 |
+
+Der gesamte restliche Diff-Stat (lib.rs 1635, compaction.rs 523 u. a. Zeilen)
+ist ausschließlich CRLF/rustfmt-Rauschen — keine Semantik.
+
+### 29.2 `wal.rs`-Edition-Frage (C.4)
+
+`wal.rs` ist **unverändert** vs d6d5916; `Cargo.toml` war bereits in d6d5916 auf
+`edition = "2024"`. Die beim `mod diag;`-Eintrag kurzzeitig gemeldete
+Parse-Warnung war ein Tool-Artefakt, kein echtes Problem. **Kein Edition- oder
+Parse-Konflikt.** Die frühere Vermutung eines Vorgänger-Edition-Problems
+bestätigt sich nicht.
+
+### 29.3 Klassifikation der Vorgänger-Arbeit (gesamtheitlich)
+
+| Bereich | Ergebnis | Konsequenz |
+|---------|----------|------------|
+| `value_cache` | korrekt, isoliert 0–11 % Effekt (§27) | **verworfen** |
+| `compaction_v2` | 12/12 grün, exakt d6d5916-Architektur (B.3) | **wertvolle Regressionstests** |
+| `diag.rs` / Bench-Harnesse | Diagnosewerkzeuge (§28) | **historisch/selektiv behalten** |
+| übrige `src/`-Änderungen | nur Format/CRLF (29.1) | **keine Produktionslogik** |
+| `wal.rs` | unverändert | **kein Risiko** |
+
+### 29.4 Abschluss
+
+Es existiert **keine C.5-Entscheidung** (behalten/verbessern/zurückbauen), weil
+keine echte, unbewertete Produktionsänderung vorliegt. Die Vorgänger-Arbeit
+besteht vollständig aus: einem verworfenen Prototyp (value_cache), wertvollen
+Regressionstests (compaction_v2), Diagnose-Infrastruktur (diag/bench) und
+Formatierungs-Rauschen.
+
+**Handover ist damit abgeschlossen.** `d6d5916` bleibt Produktionsbaseline.
+Kein Produktions-Merge aus dem Audit. Kein v0.11 ohne neuen konkreten Befund.
+Der uncommittete Vorgänger-Working-Tree bleibt bewusst unangetastet.
 getrennt: bewiesen (§27 verworfen, B.3 behalten), klassifiziert (B.4), und keine
 der beiden Linien hat die Produktionsbaseline d6d5916 angetastet.
