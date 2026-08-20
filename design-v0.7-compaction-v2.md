@@ -2181,20 +2181,80 @@ ist der permanente Regressionstest. Vollständige Test-Suite (`cargo test
 gemeinsam mit dieser Dokumentation in einem separaten Commit eingefroren.
 Die Performance-Diagnose (§30.8) bleibt unveraendert bestehen.
 
-### 30.10 Orphan-GC — separates Audit (noch nicht implementiert)
+### 30.10 Orphan-GC — Audit (E.10) und Implementierung
 
 Qualitativ anders als E.8: kein Datenverlust, sondern
-Speicher-/Betriebswartung. Vor einer etwaigen Implementierung ist nur zu
-klaeren (kein Code):
+Speicher-/Betriebswartung. Die Forensik (E.10) ergab einen kleinen, klar
+begrenzbaren, wirtschaftlich sinnvollen Fix — daher **implementiert**
+(nicht deferred, im Gegensatz zu value_cache / Compaction-fsync).
 
-- Welche Dateien duerfen ueberhaupt als Orphans gelten?
-- Wie erkennt man sicher, dass eine `.sst` nicht mehr vom aktuellen Manifest
-  referenziert wird?
-- Was passiert bei Crash genau zwischen Rename und Cleanup?
-- Darf GC beim Open automatisch loeschen oder braucht es einen expliziten
-  Maintenance-Schritt?
-- Welche Recovery-Semantik gilt fuer `.manifest.tmp`?
+**Orphan-Ursprung (Crash-Fenster in `compact()`):**
+- **W1** Crash während `write_table` (neue Segmente geschrieben, vor
+  `manifest.save()`): neue Segmente = Orphan (unreferenziert), alte
+  L0/Segmente referenziert → sicher.
+- **W2** Crash bei `tmp→rename` (atomar): entweder alter oder neuer
+  Zustand. Alt ⇒ wie W1; neu ⇒ wie W3.
+- **W3** Crash nach `manifest.save()`, vor `remove_file`-Loop: neue
+  Segmente referenziert, alte L0+overlap = Orphan (harmlos, Daten in
+  neuen Segmenten).
+- **W4** nach `remove_file`: sauber.
+`flush()` löscht niemals `.sst`; die **einzige** Löschstelle ist der Cleanup
+in `compact()` (lib.rs), und zwar **nach** `manifest.save()`.
 
-Erst danach entscheiden, ob sich ein GC-Prototyp lohnt.
+**`MANIFEST` als alleinige Recovery-Root:**
+Der Rename in `Manifest::save` (tmp + `sync_all` + atomares `rename`)
+verwirft den alten Manifest-Zustand atomar. Es gibt **keine
+Manifest-Historie**; Recovery lädt nur `MANIFEST` (nicht `.manifest.tmp`).
+Daher ist das committed Manifest die **einzige** Wurzel für die
+Garbage-Erkennung — ein „Vorgängerzustand" muss nicht berücksichtigt
+werden.
+
+**`file_id`-basierte Identifikation:**
+`next_table_id` ist strikt monoton und wird nur im committed Manifest
+persistiert; committete IDs werden nie wiederverwendet. Ein Orphan wurde
+nie in ein committed Manifest geschrieben → seine `file_id` fehlt
+**permanent** in `Manifest::all_ids()`. Selbst ein Rollback von
+`next_table_id` überschreibt die Orphan-Datei beim legitimen Neuschreiben
+korrekt (Garbage wird ersetzt). → id-basierte GC ist eindeutig und sicher.
+
+**`.manifest.tmp` als gefahrloses temporäres Artefakt:**
+`load()` liest ausschließlich `MANIFEST`; `.manifest.tmp` wird bei jedem
+`save` überschrieben bzw. ignoriert und ist niemals recovery-relevant →
+jederzeit gefahrlos löschbar.
+
+**GC-Sicherheitsinvariante:**
+> Eine `.sst`-Datei darf nur gelöscht werden, wenn ihre `file_id` zum
+> Löschzeitpunkt in der zum Scan gelesenen **committed** Manifest-Version
+> (`MANIFEST`, nicht `.manifest.tmp`) nicht enthalten ist **und** zwischen
+> Scan und Löschung kein neues Manifest committed wurde, das sie
+> referenziert. Das erfordert exklusiven Zugriff (Maintenance-Modus /
+> geschlossene DB) oder Re-Validierung unmittelbar vor dem Löschen.
+> Stray `.manifest.tmp` dürfen jederzeit gelöscht werden.
+
+**Concurrency-/Fremddatei-Risiken:**
+- *Concurrency:* Abgedeckt durch `&mut self` (exklusiver Borrow) im
+  Aufrufer — während `gc()` läuft, kann kein gleichzeitiger
+  Lese-/Schreibzugriff auf dieselbe DB-Instanz bestehen. (Ein
+  Cross-Process-Lock ist bewusst nicht implementiert; Dokumentations-
+  Limitation.)
+- *Fremddatei:* Eine extern abgelegte `.sst` mit passender Namenskonvention
+  ist nicht unterscheidbar. `gc()` überspringt daher alles, was nicht
+  exakt dem Schema `{:06}.sst` (6 Ziffern, zero-padded) entspricht; eine
+  rein numerische Fremddatei gleicher Form ist bewusst das Risiko des
+  **Opt-in-Maintenance-Schritts** (kein Auto-GC).
+
+**Implementierung (`db.gc()`, lib.rs):**
+- Nur explizit aufrufbar; **keine** automatische Bereinigung bei `open()`.
+- Erfordert exklusiven Zustand (`&mut self`).
+- Liest das committed Manifest (`self.manifest` ≡ `MANIFEST`).
+- Enumeriert alle `*.sst` im DB-Verzeichnis; löscht nur IDs ∉ Manifest.
+- Referenzierte Dateien werden niemals angetastet.
+- `.manifest.tmp` wird bereinigt.
+- Keine Änderung am Manifest, keine Compaction.
+
+**Tests (`tests/orphan_gc.rs`):** Orphan vor/nach Manifest-Commit,
+referenzierte SST nie gelöscht, Corrupt/missing referenzierte SST nicht als
+Garbage behandelt, `.manifest.tmp` entfernt, Fremd-`.sst` (nicht 6-stellig)
+übersprungen.
 
 **Kein Commit. Kein Produktionscode geändert.**
