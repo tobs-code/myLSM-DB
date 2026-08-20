@@ -1733,5 +1733,156 @@ Gegenmessung → Prototyp → Wirtschaftlichkeitsgate → Realitätscheck) saube
 `d6d5916` unangetastet.**
 
 
+## §27 Vorgänger-LLM Audit — `value_cache` / Write-Cache
+
+Nach Abschluss der eigenen v0.9/v0.10-Linie (§23–§26.11) wurde die im Working
+Tree liegende Vorgänger-Arbeit des vorherigen Coding-LLMs systematisch
+übernommen (Phase A: Repository-Handover-Audit). Der `value_cache`-Prototyp
+(v0.7-write-cache, Variante A: Old-Value-Cache im `put_entity`-Pfad) war der
+Zweig mit der stärksten Verbindung zu einer bereits bekannten offenen Frage aus
+v0.8 (Disk-Old-Value-Lookups im Write-Pfad). Er wurde vollständig auditiert,
+ohne Dateien zu verändern oder zu committen.
+
+### 27.1 B.1 — Forensik (Korrektheit)
+
+**Architektur:** `value_cache: HashMap<(cid, eid), HashMap<fid, Value>>` lebt als
+Feld im `EntityStore`, ausschließlich unter `#[cfg(feature = "bench-diag")]`.
+Im normalen Release-Build existiert das Feld nicht (kein Overhead, keine
+Produktionskopplung).
+
+**Befüllung/Update:** in `core_put_entity` write-through als *whole-map replace*
+nach erfolgreichem Put → enthält danach exakt die indexierten Feldwerte der
+Entity. Entfernte Felder fallen automatisch heraus.
+
+**Lese:** nur für indexierte, geschriebene Felder → liefert Old-Value ohne
+Disk-Read (Cache-Hit), sonst Fallback auf Point-Lookup (Cache-Miss).
+
+**Invalidation (vollständig):**
+- Put (non-tx): whole-map replace ✓
+- Delete (non-tx): `value_cache.remove(eid)` ✓
+- Tx commit: `value_cache.remove(eid)` ✓
+- Tx update/delete: übergeben `None` → nie Cache-Konsultation ✓
+- Reopen: Cache ist in-memory, nicht persistiert → leer → Cold-Fallback ✓
+
+**Testabdeckung (`tests/write_cache.rs`, 7 Tests):** Oracle warm==cold über 8
+Schritte inkl. Feld-Remove/Reinsert/Interleave; Reopen-Cold-Fallback; 400-Iter-
+Flush/Compaction-Konsistenz; Cache-Miss bei nachträglich indexiertem Feld;
+Multi-Feld-Cache-Hit; Tx-Rollback (Cache bleibt) + Commit (inval).
+→ **Korrektheit formal gut bewiesen.**
+
+### 27.2 B.2 — erster Benchmark (NICHT isoliert)
+
+Vergleich Warm `put`+Cache gegen Transaction-Update ohne Cache.
+Ergebnis: **81–98 %** Ersparnis (Δ/COLD) über alle Indexdichten (1–8) und
+Entity-Größen (4–64 Felder).
+
+**Methodischer Fehler:** dieser Vergleich mischt zwei Variablen —
+(1) fehlender Old-Value-Cache und (2) zusätzlicher Transaction-/Commit-Overhead.
+Die 81–98 % sind **überwiegend Tx-Overhead**, nicht Cache-Wirkung. Daher ist
+B.2 als Entscheidungsgrundlage **zu verwerfen**.
+
+### 27.3 B.2a — faire Kontrollmessung (reiner Cache-Effekt)
+
+Zwei separate Builds (`--features bench-diag` vs. ohne), identischer non-tx
+Put-Stream, konstante Indizes/Flush/Dataset, Warmup + Messrunde.
+Cache-Gewinn = (cold_non_tx − warm_cache) / cold_non_tx.
+
+| idx | fields | ON (µs) | OFF (µs) | Δ | Anteil |
+|-----|--------|---------|----------|---|--------|
+| 0   | 4/16/64 | ~10/30/116 | ~7/27/112 | negativ | innerhalb Rauschen |
+| 1   | 4/16/64 | 10/33/127 | 10/31/116 | 0.5/2.6/10.9 | 5/9/9 % |
+| 2   | 4/16/64 | 14/35/125 | 13/39/117 | 1/−4/8 | 6/−/7 % |
+| 4   | 4/16/64 | 21/40/128 | 19/49/126 | 1/−8/2 | 7/−/2 % |
+| 8   | 4/16/64 | 21/57/156 | 19/55/140 | 2/2/16 | 10/3/11 % |
+
+**Ergebnis:** isolierter Cache-Effekt **~0–11 %**, teilweise negative Werte
+(innerhalb des Messrauschens / Overhead). Der Cache eliminiert im nicht-
+transaktionalen Pfad **keinen relevanten** Anteil des Write-Aufwands.
+
+**Erklärung:** beim non-tx `put_entity` mit `field_hint` werden ohnehin nur
+gezielte Point-Lookups für Stale-Candidates und geschriebene indexierte Felder
+gemacht (MemTable-Lookup, keine Disk-Seek). Bei breiten Entities dominiert das
+Schreiben der Feld- + Index-Keys den Aufwand, nicht der Old-Value-Lookup.
+
+### 27.4 Schlussfolgerung
+
+- **Technisch korrekt:** Prototyp ist solide (B.1), Oracle-Tests grün.
+- **Wirtschaftlich nicht relevant:** isolierter Cache-Effekt ~0–11 %.
+
+> **Im untersuchten nicht-transaktionalen Write-Workload liegt der isolierte
+> Cache-Effekt bei etwa 0–11 % und ist damit kein hinreichender Grund für eine
+> Produktionsintegration.**
+
+(Die Formulierung ist bewusst nicht absolut: ein anderer Workload — z. B. sehr
+hohe Indexdichte bei extrem teuren Disk-Seeks — könnte theoretisch anders
+aussehen; im gemessenen Pfad ist der Effekt vernachlässigbar.)
+
+### 27.5 Audit-Status
+
+- Keine Änderung an `d6d5916`.
+- Kein Produktions-Merge des `value_cache`.
+- Kein Eviction-/Memory-Design (da kein relevanter Gewinn).
+- Kein weiterer Cache-Mikrobenchmark.
+- `value_cache`-Prototyp bleibt als Vorgänger-Artefakt im Tree, nicht in
+  unserer Historie (6b65191).
+- Vorgänger-Arbeit `compaction_v2`, `diag.rs`, `examples/bench.rs` u. a.
+  bleiben für Phase B.3 ff. im Tree (nicht angefasst).
+
+**Damit ist ein weiterer plausibler Optimierungszweig experimentell
+ausgeschlossen** — analog zu v0.10, aber über einen anderen Pfad (saubere
+Kontrollmessung statt synthetischem Benchmark).
+
+
+
 
 `d6d5916` bleibt während der gesamten Phase 1 unangetastet.
+
+
+## §28 Vorgänger-LLM Handover-Audit — Abschluss
+
+Die in Phase A begonnene Übernahme der Vorgänger-Arbeit (Working-Tree des
+vorherigen Coding-LLMs) ist vollständig auditiert. Es wurden **keine Dateien
+verändert** (außer dem temporären `mod diag;`-Eintrag in `lib.rs`, der den
+Prototyp lediglich baubar machte) und **nichts committet**. §23–§26 bleiben die
+eingefrorene eigene Diagnoselinie.
+
+### 28.1 Ergebnisse
+
+| Zweig | Audit | Ergebnis | Klassifikation |
+|-------|-------|----------|----------------|
+| `value_cache` (v0.7-write-cache, A) | §27 B.1/B.2/B.2a | technisch korrekt, isolierter Cache-Effekt ~0–11 % → wirtschaftlich verworfen | Klasse B (korrekt, nicht relevant) |
+| `compaction_v2` | B.3 | 12/12 Regressionstests grün; testet exakt die d6d5916-Compaction-Architektur (`src/compaction.rs` hat 0 echte Diff zu d6d5916) | Klasse B (wertvolle Regression) |
+| `src/diag.rs` | B.4 | atomare Counter, Feature-Gate vollständig (alle Aufrufe gated oder hinter `if active()`, Default `false` → no-op), keine Produktionskopplung | Klasse B (Diagnose-Infra) |
+| `examples/bench.rs` | B.4 | v0.7 Baseline-Benchmark, kompiliert mit `bench-diag`, isolierte Workloads | Klasse B (Diagnose-Infra) |
+| `examples/bench-ir.rs`, `bench-ir2.rs`, `bench-v2.rs`, `bench-v8.rs` | B.4 | historische v0.7/v0.8-Diagnoseharnesse; brauchen Features `bench-diag-ir(2)/v2/v8`, die **nicht** in `Cargo.toml` definiert sind → aktuell nicht kompilierbar | Klasse C (historisch, nicht baubar) |
+
+### 28.2 Präzisierung `src/diag.rs`
+
+`diag.rs` ist **kein Produktionsbestandteil** und wird hier nicht als solches
+„behalten“. Es ist reine Diagnose-Infrastruktur (atomare Counter, nur mit
+`--features bench-diag` aktiv). Ob die Datei langfristig im Repository verbleibt,
+ist eine **separate Cleanup-/Historienentscheidung**, nicht Teil dieses Audits.
+Die in B.4 festgestellte Abwesenheit einer Produktionskopplung bedeutet nur:
+das Modul beeinflusst das Laufzeitverhalten ohne `enable()`-Aufruf nicht.
+
+### 28.3 Invarianten
+
+- **Keine Produktionsänderung:** kein Storage-/Index-/Compaction-Code von
+  d6d5916 abgewichen (验证 über `git diff d6d5916`: `src/compaction.rs` leer,
+  `src/manifest.rs` nur rustfmt, `src/entity.rs` nur Vorgänger-rustfmt + die
+  feature-gated `value_cache`-Spur, die nicht im Release-Pfad liegt).
+- **Kein Commit** im Rahmen dieses Audits.
+- `d6d5916` bleibt **Produktionsbaseline**.
+- `6b65191` bleibt die **eingefrorene v0.9/v0.10-Diagnoselinie**.
+
+### 28.4 Nächster Schritt
+
+Erst bei einem **neuen konkreten, reproduzierbaren Befund** (eigene Messung oder
+neuer Vorgänger-Zweig mit nachweisbarem Nutzen) wird ein neuer Diagnose-Sprint
+(ggf. v0.11) eröffnet — wieder bei Diagnose, nicht bei Implementierung. Die
+historischen Bench-Harnesse (Klasse C) rechtfertigen keinen weiteren Sprint.
+
+**Damit ist der Handover von der Vorgänger-Arbeit abgeschlossen.** Eigene
+Diagnose (§23–§26) und übernommene Vorgänger-Arbeit sind sauber voneinander
+getrennt: bewiesen (§27 verworfen, B.3 behalten), klassifiziert (B.4), und keine
+der beiden Linien hat die Produktionsbaseline d6d5916 angetastet.
