@@ -1937,3 +1937,176 @@ Kein Produktions-Merge aus dem Audit. Kein v0.11 ohne neuen konkreten Befund.
 Der uncommittete Vorgänger-Working-Tree bleibt bewusst unangetastet.
 getrennt: bewiesen (§27 verworfen, B.3 behalten), klassifiziert (B.4), und keine
 der beiden Linien hat die Produktionsbaseline d6d5916 angetastet.
+
+---
+
+## §30 Compaction-Forensik — fsync-Dominanz (neue Diagnoselinie, post-v0.10)
+
+> **Diagnose, keine Lösung.** Kein Produktionscode geändert; kein v0.11-Design
+> abgeleitet. Nächster Schritt ist das Real-Workload-Gate (§30.6).
+
+### 30.1 Ausgangspunkt
+
+Neuer Diagnosezyklus nach dem abgeschlossenen v0.9/v0.10-Zyklus (§23–§26) und
+dem Handover-Audit (§27–§29). Ziel: eine belastbare neue Performance-Frage mit
+eigener Messung. Erste Basis-Messung (`bench-baseline.rs`, feature-frei, vier
+getrennte Blöcke Put/Flush/Compaction/Read): Compaction ist der dominante
+Kostenblock (bei 10k Writes/50 Segmenten ~1.2 s), Put/Flush/Read bleiben im
+sub-ms-Bereich.
+
+### 30.2 Isolierte Compaction-Matrix
+
+`bench_compaction_isolated` baut einen definierten L1-Zustand auf (Phase A,
+nicht gemessen) und misst genau den einen `flush()`, der die Overlap-Compaction
+über alle Segmente auslöst (Phase B). Setup-Fehlschluss behoben: `Options`
+Default `segment_max_records=30 000` legte alle Writes in ein Segment; das
+Setup nutzt jetzt `segment_max_records=8` + `l0_compact_threshold=2`.
+
+| Segmente | compact() | ms/Seg |
+|---:|---:|---:|
+| 6 | 23.1 ms | 3.86 |
+| 10 | 30.0 ms | 3.00 |
+| 26 | 64.7 ms | 2.49 |
+| 50 | 120.2 ms | 2.40 |
+
+Skalierung ~linear in der Segmentzahl; `segs_after == segs_before` (Spread-Batch
+über den gesamten Key-Range, Voll-Overlap, WA ~1x).
+
+### 30.3 Trennung Merge/Read vs. Output/Manifest/Cleanup
+
+`bench_compaction_forensic` zerlegt die Compaction ohne Produktionscode:
+- `base_flush` — eine Table schreiben + Manifest fsync (Referenz, frische DB)
+- `merge_read` — voller `scan()` als Proxy für `merge_ids` (liest dieselben Quellen, nur über öffentliche API)
+- `compact_total` — der eine `flush()`, der die Overlap-Compaction auslöst
+- Output+Manifest+Cleanup — Rest (`compact_total − merge_read − base_flush`)
+
+Matrix (Segmente × Records/Segment):
+
+| Segmente | Rec/Seg | Rows | compact() gesamt | Merge/Read | Output+Manifest+Cleanup |
+|---:|---:|---:|---:|---:|---:|
+| 6 | 8 | 48 | 18.9 ms | 1.1 ms | **12.9 ms** |
+| 6 | 800 | 4800 | 31.4 ms | 9.6 ms | **16.1 ms** |
+| 10 | 8 | 80 | 26.8 ms | 1.5 ms | **19.7 ms** |
+| 10 | 800 | 8000 | 54.3 ms | 15.7 ms | **33.0 ms** |
+| 26 | 8 | 208 | 62.6 ms | 3.8 ms | **54.1 ms** |
+| 26 | 800 | 20800 | 109.7 ms | 41.1 ms | **63.2 ms** |
+| 50 | 8 | 400 | 111.4 ms | 6.8 ms | **99.6 ms** |
+| 50 | 800 | 40000 | 209.9 ms | 79.2 ms | **124.7 ms** |
+
+**Befund:** Output+Manifest+Cleanup dominiert in allen 12 Konfigurationen und
+skaliert primär mit der **Segmentzahl** (~2 ms/Segment), nicht mit der
+Recordzahl (segs=50: 99.6 ms bei 400 Rows vs 124.7 ms bei 40 000 Rows — fast
+flach). Merge/Read ist kein Hotspot (1–7 ms bei kleinen Beständen, erst bei
+40k Rows 79 ms).
+
+### 30.4 Codebefund
+
+`TableBuilder::finish()` (`src/sstable.rs`) ruft pro geschriebener SSTable
+`w.flush()?` + `w.get_ref().sync_all()?` auf — ein `sync_all()` **je Segment**.
+`Manifest::save()` (`src/manifest.rs`) synchronisiert zusätzlich einmal (`f.sync_all()`).
+Die 3a-Compaction schreibt über `write_table` jedes neue Segment einzeln
+(`compact()` in `src/lib.rs`) und ruft danach `Manifest::save()` auf.
+
+**50 Segmente ≈ 50 SSTable-fsyncs + 1 Manifest-fsync = ~51 fsyncs.**
+
+### 30.5 Unabhängige Kontrollmessung (`bench_fsync`)
+
+N gleich große Dateien (8 KB, gleicher Temp-Dir wie die DB), `write+flush` vs
+`write+flush+sync_all`, Median über 7 Runden:
+
+| N Dateien | write+flush | + sync_all | sync-Delta/Datei |
+|---:|---:|---:|---:|
+| 1 | 0.76 ms | 1.85 ms | ~1.09 ms |
+| 10 | 5.06 ms | 13.82 ms | ~0.88 ms |
+| 25 | 11.70 ms | 33.11 ms | ~0.86 ms |
+| 50 | 26.92 ms | 71.86 ms | ~0.90 ms |
+
+**Kausalitätskette bewiesen:** Segmentzahl → Anzahl `sync_all()` → Latenz.
+`sync_all` kostet ~0.9 ms/Datei, konstant und strikt linear; die Forensik-Zahlen
+(50 Segmente ≈ 100 ms Output) decken sich mit der Kontrolle + Manifest-fsync +
+Cleanup.
+
+### 30.6 Nächster Schritt — Real-Workload-Gate (noch kein v0.11)
+
+Die Hypothese ist bewiesen, aber noch nicht wirtschaftlich relevant. Entscheidend
+ist die Frage:
+
+> **Erzeugt der tatsächliche Workload genügend kleine Segmente, dass diese
+> Kosten relevant werden?**
+
+Gate: realer Multi-Segment-Workload mit mindestens **10k / 50k / 100k Entities**
+(incl. warmer Updates) messen und die tatsächlich entstehende **Segmentzahl**
+erfassen. Nur wenn dort regelmäßig 25–50+ Segmente entstehen, ist der fsync-Befund
+ein v0.11-Kandidat; bei nur 3–5 Segmenten bleibt die Hypothese korrekt, aber
+wirtschaftlich uninteressant (wie value_cache §27).
+
+**Explizit noch NICHT entschieden:**
+- Kein Batch-/Deferred-fsync-Design abgeleitet.
+- **Durability/Recovery bleibt offene Correctness-Frage:** Wann gilt eine neue
+  Compaction-SSTable als dauerhaft? Was passiert bei Crash zwischen
+  SSTable-Schreiben und Manifest-Sync? Ist gebündeltes Sync ohne
+  Recovery-Sicherheitsverlust möglich? Das ist ein eigenes
+  Correctness-/Recovery-Thema, nicht nur Performance.
+- Nächster Schritt erst nach dem Real-Workload-Gate; dann §30 → Wirtschaftlichkeitsgate
+  → erst dann eventuell v0.11-Prototyp.
+
+**Kein Commit. Kein Produktionscode geändert.**
+
+### 30.7 Real-Workload-Gate — Ergebnis (negativ für Defaults)
+
+Messung (`bench_entity_gate` in `examples/bench-baseline.rs`, Production-Defaults
+`memtable_limit=4MB`, `segment_max_records=30k`, `l0_compact_threshold=4`):
+Entities mit 4 Feldern + Index auf `age`, danach 5× warme Re-Puts auf das Hot-Set
+(10%). Erfasst wird die Endstruktur nach `flush()` + `close()` über eine frische
+`Database`-View (`table_count`/`segment_count`/`level_tables(0)`).
+
+| Entities | KV-Records | tables | Segmente | L0 |
+|---:|---:|---:|---:|---:|
+| 10k | ~50k | 1 | **0** | 1 |
+| 50k | ~250k | 3 | **0** | 3 |
+| 100k | ~500k | 18 | **17** | 1 |
+
+**Befund:**
+1. **Warme Updates erzeugen KEINE Segmentexplosion.** Die Segmentzahl skaliert mit
+   dem Gesamt-Datenvolumen (Gesamt-Records ÷ `segment_max_records`), nicht mit der
+   Update-Frequenz. Hot-Set-Re-Puts landen als Overwrite in neuen L0-Tabellen und
+   werden bei der nächsten Compaction gemerged, ohne die Segmentanzahl zu erhöhen.
+2. **Bei Defaults sind Segmente groß** (30k Records), nicht die 8-Record-Minisegmente
+   der Diagnose-Konfiguration. 100k Entities ergeben nur 17 Segmente.
+3. **Compaction-Last überschlagsmäßig:** ~18 Flush-Äquivalente → bei Threshold 4
+   ≈ 4–5 Compactions, zusammen ~25–35 geschriebene SSTables über den ganzen
+   Workload → bei ~0.9 ms/fsync ≈ **25–30 ms total auf 7.6 s Workload ≈ 0.4 %**.
+4. Die 25–50-Segment-Schwelle aus §30.6 wird bei Defaults erst ab
+   >150k Entities (≥750k Records ÷ 30k = 25 Segmente) erreicht.
+
+**Gate-Entscheidung: Der fsync-Befund ist wirtschaftlich korrekt, aber für
+Production-Defaults bis 100k Entities irrelevant** (~0.4 % des Workloads). Er wird
+nur relevant, wenn Nutzer `segment_max_records` oder `memtable_limit` klein wählen
+(diagnose-/bench-ähnliche Konfigurationen) oder Bestände weit über 150k Entities
+erreichen. Damit ist das Gate **negativ**: kein v0.11-Prototyp für Batch-fsync als
+Default-Änderung abgeleitet. Die Correctness-Frage (wann gilt eine Compaction-SSTable
+als dauerhaft, Crash zwischen SSTable-Schreiben und Manifest-Sync) bleibt davon
+unabhängig offen (§30.6).
+
+### 30.8 Fazit — Zyklus abgeschlossen
+
+Der fsync/Compaction-Zweig ist damit vollständig abgearbeitet:
+
+1. **Technisch real** — ein echter, reproduzierbarer Hotspot der 3a-Compaction.
+2. **Kausal bewiesen** — `Segmentzahl → Anzahl sync_all() → Latenz`, isoliert gemessen
+   (Kontrollmessung §30.5, Forensik §30.3).
+3. **Gegen den realen Production-Workload gegated** (§30.7) — bei Production-Defaults
+   bis 100k Entities keine Segmentdichte, die per-Segment-fsync-Kosten relevant
+   werden lässt.
+4. **Wirtschaftlich verworfen** — kein v0.11-Prototyp unter den aktuellen Defaults.
+
+Kleine `segment_max_records`/`memtable_limit` und Datenbestände >150k Entities sind
+damit **zukünftige mögliche Triggerbedingungen** für diesen Befund, ausdrücklich
+**keine offene Optimierungsaufgabe**. Erst ein neuer realer Hotspot oder ein
+verändertes Workload-/Produktionsprofil rechtfertigt den nächsten Diagnosezyklus —
+nicht die bloße Neugier auf eine Optimierung.
+
+**Diagnose-Freeze: §30 Compaction-fsync diagnosis complete; no production
+optimization justified under current defaults.**
+
+**Kein Commit. Kein Produktionscode geändert.**
