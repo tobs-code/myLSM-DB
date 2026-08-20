@@ -14,3 +14,22 @@ crc32fast = "1.4"
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# Diagnose-Examples: dürfen nur mit ihrem Feature gebaut werden,
+# damit `cargo build`/`cargo test` ohne Feature den Produktionspfad sauber
+# kompilieren (Prototyp-Code bleibt einkompilierbar-getrennt).
+[[example]]
+name = "bench-v9"
+required-features = ["bench-diag"]
+
+[[example]]
+name = "bench-v9a"
+required-features = ["bench-diag"]
+
+[[example]]
+name = "bench-v9b"
+required-features = ["bench-diag"]
+
+[[example]]
+name = "bench-v2"
+required-features = ["bench-diag"]
