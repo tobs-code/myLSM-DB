@@ -27,5 +27,5 @@ pub mod physical;
 pub mod planner;
 
 pub use ast::{Cmp, Predicate, eq, ge, gt, le, lt, ne};
-pub use logical::{LogicalPlan, QueryBuilder, SortDir};
+pub use logical::{Aggregate, LogicalPlan, QueryBuilder, SortDir};
 pub use planner::plan;

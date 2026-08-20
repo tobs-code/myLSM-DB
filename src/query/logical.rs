@@ -13,6 +13,31 @@ pub enum SortDir {
     Desc,
 }
 
+/// Aggregationsfunktion für `execute_aggregate` (Terminal-Schritt, läuft über
+/// die gefilterte, sortierte, limitierte Ergebnismenge).
+///
+/// Semantik (siehe `design-v0.8-query.md` §3):
+/// - `Count`: Anzahl der Zeilen (immer `Some(Int)`).
+/// - `Sum`/`Avg`/`Min`/`Max(field)`: nur numerische Werte des Feldes;
+///   NULL/absent/non-numeric werden übersprungen. `Sum` akkumuliert in `i128`
+///   und sättigt auf `i64`; sobald ein `Float` auftritt, wird zu `Float64`.
+///   `Avg` liefert immer `Float64`. `Min`/`Max` bleiben `Int64` bzw. werden bei
+///   Typmischung zu `Float64` promoviert. Nicht-endliche Floats werden
+///   übersprungen. Leere/Null-wertige Menge → `None` (außer `Count`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Aggregate {
+    /// Anzahl der (gefilterten, sortierten, limitierten) Zeilen.
+    Count,
+    /// Summe der numerischen Werte von `field`.
+    Sum(String),
+    /// Arithmetisches Mittel der numerischen Werte von `field` (Float64).
+    Avg(String),
+    /// Minimum der numerischen Werte von `field`.
+    Min(String),
+    /// Maximum der numerischen Werte von `field`.
+    Max(String),
+}
+
 /// Logischer Plan.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -51,10 +76,17 @@ impl LogicalPlan {
 
 /// Fluent-Builder für eine Query. Intern wird der Plan von innen aufgebaut:
 /// die äußerste Schicht (z.B. `Filter`/`Limit`) ist `self.plan`.
+///
+/// `projection` und `aggregation` sind **Terminal-Schritte** (wechselseitig
+/// exklusiv): sie werden nach Scan/Filter/Sort/Limit auf die Ergebnismenge
+/// angewandt. Beide gleichzeitig ist ein Fehler (siehe `execute_query` /
+/// `execute_aggregate`).
 #[derive(Debug, Clone)]
 pub struct QueryBuilder {
     collection: String,
     plan: LogicalPlan,
+    pub(crate) projection: Option<Vec<String>>,
+    pub(crate) aggregation: Option<Aggregate>,
 }
 
 impl QueryBuilder {
@@ -64,6 +96,8 @@ impl QueryBuilder {
             plan: LogicalPlan::Collection {
                 name: collection.to_string(),
             },
+            projection: None,
+            aggregation: None,
         }
     }
 
@@ -103,6 +137,24 @@ impl QueryBuilder {
             input: Box::new(self.plan),
             n,
         };
+        self
+    }
+
+    /// Projiziert das Ergebnis auf die angegebenen Felder (Result-Form, kein
+    /// Storage-/Decode-Trick). Die Reihenfolge der Ergebnisfelder folgt der
+    /// Reihenfolge der Anfrage; ein angefordertes, aber auf einer Entity
+    /// fehlendes Feld wird für diese Entity weggelassen (nicht als `Null`
+    /// eingefügt). Eine leere Feldliste ist ein Fehler (`InvalidArgument`,
+    /// geprüft bei der Ausführung). Projektion und Aggregation sind exklusiv.
+    pub fn project(mut self, fields: &[&str]) -> QueryBuilder {
+        self.projection = Some(fields.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Setzt eine Aggregation als Terminal-Schritt (siehe [`Aggregate`]).
+    /// Projektion und Aggregation sind exklusiv.
+    pub fn aggregate(mut self, agg: Aggregate) -> QueryBuilder {
+        self.aggregation = Some(agg);
         self
     }
 

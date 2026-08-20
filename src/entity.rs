@@ -780,10 +780,52 @@ impl EntityStore {
 
     /// Plant und führt eine Query aus. Ergebnis: `Vec<(Entity-ID, Entity)>`
     /// (wie `scan_collection`). Die Query ist rein lesend.
+    ///
+    /// Ist am Builder eine Aggregation gesetzt, wird `execute_aggregate`
+    /// verlangt (beide Terminal-Schritte sind exklusiv). Eine leere
+    /// Projektions-Feldliste ist ein `InvalidArgument`-Fehler.
     pub fn execute_query(&mut self, builder: QueryBuilder) -> Result<Vec<(String, Entity)>> {
+        let projection = builder.projection.clone();
+        let aggregation = builder.aggregation.clone();
+        if aggregation.is_some() {
+            return Err(Error::InvalidArgument(
+                "query has an aggregation; use execute_aggregate".into(),
+            ));
+        }
+        let projection = match projection {
+            Some(p) if p.is_empty() => {
+                return Err(Error::InvalidArgument("empty projection".into()));
+            }
+            Some(p) => Some(p),
+            None => None,
+        };
         let logical = builder.build();
         let physical = query::planner::plan(&self.schema, logical);
-        query::executor::run(&mut self.db, &self.schema, &physical)
+        let rows = query::executor::run(&mut self.db, &self.schema, &physical)?;
+        Ok(match projection {
+            Some(fields) => query::executor::project_rows(rows, &fields),
+            None => rows,
+        })
+    }
+
+    /// Aggregiert über das (gefilterte, sortierte, limitierte) Ergebnis einer
+    /// Query. Liefert `Option<Value>` (SQL-artiges `NULL` = `None` bei leerer /
+    /// Null-wertiger Menge, außer `Count`). Eine Projektion am Builder ist
+    /// nicht zulässig (Terminal-Schritte sind exklusiv).
+    pub fn execute_aggregate(&mut self, builder: QueryBuilder) -> Result<Option<Value>> {
+        if builder.projection.is_some() {
+            return Err(Error::InvalidArgument(
+                "query has a projection; aggregation is mutually exclusive".into(),
+            ));
+        }
+        let aggregation = match &builder.aggregation {
+            Some(a) => a.clone(),
+            None => return Err(Error::InvalidArgument("no aggregation specified".into())),
+        };
+        let logical = builder.build();
+        let physical = query::planner::plan(&self.schema, logical);
+        let rows = query::executor::run(&mut self.db, &self.schema, &physical)?;
+        query::executor::aggregate_rows(&rows, &aggregation)
     }
 
     /// Plant eine Query und liefert die Text-Baumdarstellung des Physical Plans
@@ -926,15 +968,59 @@ impl<'a> Transaction<'a> {
     /// das Pending-Overlay). Read-your-own-writes: sieht committete Daten UND
     /// die eigenen, noch uncommitteten Writes — für Entity- und Index-Daten
     /// über dasselbe Overlay. Schema bleibt read-only.
+    ///
+    /// Eine Aggregation am Builder verlangt `execute_aggregate`; eine leere
+    /// Projektions-Feldliste ist ein `InvalidArgument`-Fehler.
     pub fn execute_query(&mut self, builder: QueryBuilder) -> Result<Vec<(String, Entity)>> {
         self.check_active()?;
+        let projection = builder.projection.clone();
+        let aggregation = builder.aggregation.clone();
+        if aggregation.is_some() {
+            return Err(Error::InvalidArgument(
+                "query has an aggregation; use execute_aggregate".into(),
+            ));
+        }
+        let projection = match projection {
+            Some(p) if p.is_empty() => {
+                return Err(Error::InvalidArgument("empty projection".into()));
+            }
+            Some(p) => Some(p),
+            None => None,
+        };
         let logical = builder.build();
         let physical = query::planner::plan(&self.store.schema, logical);
         let mut m = TxMutator {
             db: &mut self.store.db,
             pending: &mut self.pending,
         };
-        query::executor::run_m(&mut m, &self.store.schema, &physical)
+        let rows = query::executor::run_m(&mut m, &self.store.schema, &physical)?;
+        Ok(match projection {
+            Some(fields) => query::executor::project_rows(rows, &fields),
+            None => rows,
+        })
+    }
+
+    /// Aggregiert über das (gefilterte, sortierte, limitierte) Ergebnis einer
+    /// Query **innerhalb der Transaktion** (siehe `EntityStore::execute_aggregate`).
+    pub fn execute_aggregate(&mut self, builder: QueryBuilder) -> Result<Option<Value>> {
+        self.check_active()?;
+        if builder.projection.is_some() {
+            return Err(Error::InvalidArgument(
+                "query has a projection; aggregation is mutually exclusive".into(),
+            ));
+        }
+        let aggregation = match &builder.aggregation {
+            Some(a) => a.clone(),
+            None => return Err(Error::InvalidArgument("no aggregation specified".into())),
+        };
+        let logical = builder.build();
+        let physical = query::planner::plan(&self.store.schema, logical);
+        let mut m = TxMutator {
+            db: &mut self.store.db,
+            pending: &mut self.pending,
+        };
+        let rows = query::executor::run_m(&mut m, &self.store.schema, &physical)?;
+        query::executor::aggregate_rows(&rows, &aggregation)
     }
 
     /// Committet die Transaktion atomar: WAL (`Begin` → Mutationen → `Commit`),

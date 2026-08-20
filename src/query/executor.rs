@@ -28,7 +28,7 @@ use crate::ordering;
 use crate::schema::Schema;
 use crate::{Database, DirectMutator, Mutator, ScanStream};
 
-use super::logical::SortDir;
+use super::logical::{Aggregate, SortDir};
 use super::physical::PhysicalPlan;
 
 /// Stream über `(id, Entity)`-Zeilen. Bietet die Operator-Verkettung.
@@ -422,4 +422,138 @@ fn sort_rows(rows: &mut [(String, Entity)], field: &str, dir: SortDir) {
             a.0.cmp(&b.0)
         }
     });
+}
+
+/// Projiziert jede Zeile auf die angeforderten Felder (Result-Form).
+///
+/// Die Reihenfolge der Ergebnisfelder folgt `fields`. Ein angefordertes Feld,
+/// das auf einer Entity **fehlt** (`field()` = `None`), wird weggelassen; ein
+/// vorhandenes `Value::Null` wird dagegen eingeschlossen. Dies ist bewusst
+/// KEINE Decode-/Storage-Optimierung — die Entities werden vollständig
+/// materialisiert und danach auf die angeforderten Felder reduziert.
+pub fn project_rows(
+    rows: Vec<(String, Entity)>,
+    fields: &[String],
+) -> Vec<(String, Entity)> {
+    rows.into_iter()
+        .map(|(id, e)| {
+            let mut pe = Entity::new();
+            for f in fields {
+                if let Some(v) = e.field(f) {
+                    pe.fields.push((f.clone(), v.clone()));
+                }
+            }
+            (id, pe)
+        })
+        .collect()
+}
+
+/// Aggregiert über die finalen (gefilterten, sortierten, limitierten) Zeilen.
+///
+/// Semantik exakt nach `design-v0.8-query.md` §3: NULL/absent/non-numeric
+/// werden übersprungen; `Sum` akkumuliert in `i128` und sättigt auf `i64`
+/// (bzw. `Float64`, sobald ein `Float` auftritt); `Avg` liefert immer
+/// `Float64`; `Min`/`Max` bleiben `Int64` bzw. werden bei Typmischung zu
+/// `Float64` promoviert; nicht-endliche Floats werden übersprungen. Eine
+/// leere/Null-wertige Menge liefert `None` — außer `Count`, das immer
+/// `Some(Int)` liefert.
+pub fn aggregate_rows(rows: &[(String, Entity)], agg: &Aggregate) -> Result<Option<Value>> {
+    match agg {
+        Aggregate::Count => Ok(Some(Value::Int(rows.len() as i64))),
+        Aggregate::Sum(field)
+        | Aggregate::Avg(field)
+        | Aggregate::Min(field)
+        | Aggregate::Max(field) => {
+            let is_min = matches!(agg, Aggregate::Min(_));
+            let mut has_float = false;
+            let mut i_sum: i128 = 0;
+            let mut f_sum: f64 = 0.0;
+            let mut count: u64 = 0;
+            let mut i_extreme: Option<i64> = None;
+            let mut f_extreme: Option<f64> = None;
+            for (_, e) in rows {
+                let Some(v) = e.field(field) else {
+                    continue;
+                };
+                match v {
+                    Value::Null => continue,
+                    Value::Int(i) => {
+                        i_sum = i_sum.saturating_add(*i as i128);
+                        f_sum += *i as f64;
+                        count += 1;
+                        i_extreme = Some(match i_extreme {
+                            None => *i,
+                            Some(c) => {
+                                if is_min {
+                                    c.min(*i)
+                                } else {
+                                    c.max(*i)
+                                }
+                            }
+                        });
+                        let f = *i as f64;
+                        f_extreme = Some(match f_extreme {
+                            None => f,
+                            Some(c) => {
+                                if is_min {
+                                    c.min(f)
+                                } else {
+                                    c.max(f)
+                                }
+                            }
+                        });
+                    }
+                    Value::Float(x) => {
+                        if !x.is_finite() {
+                            continue; // NaN/Inf überspringen
+                        }
+                        has_float = true;
+                        f_sum += *x;
+                        count += 1;
+                        let f = *x;
+                        f_extreme = Some(match f_extreme {
+                            None => f,
+                            Some(c) => {
+                                if is_min {
+                                    c.min(f)
+                                } else {
+                                    c.max(f)
+                                }
+                            }
+                        });
+                    }
+                    // String / Bytes / Bool: nicht-numerisch → überspringen.
+                    _ => continue,
+                }
+            }
+            if count == 0 {
+                return Ok(None);
+            }
+            match agg {
+                Aggregate::Sum(_) => {
+                    if has_float {
+                        Ok(Some(Value::Float(f_sum)))
+                    } else {
+                        let s = if i_sum > i64::MAX as i128 {
+                            i64::MAX
+                        } else if i_sum < i64::MIN as i128 {
+                            i64::MIN
+                        } else {
+                            i_sum as i64
+                        };
+                        Ok(Some(Value::Int(s)))
+                    }
+                }
+                Aggregate::Avg(_) => Ok(Some(Value::Float(f_sum / count as f64))),
+                Aggregate::Min(_) | Aggregate::Max(_) => {
+                    if has_float {
+                        Ok(f_extreme.map(Value::Float))
+                    } else {
+                        Ok(i_extreme.map(Value::Int))
+                    }
+                }
+                Aggregate::Count => unreachable!(),
+            }
+        }
+    }
 }
