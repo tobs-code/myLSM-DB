@@ -15,6 +15,11 @@ crc32fast = "1.4"
 [dev-dependencies]
 tempfile = "3.10"
 
+# Admin/Operability-CLI (v1.0): inspect / stats / compact / gc.
+[[bin]]
+name = "lsm-admin"
+path = "src/bin/lsm-admin.rs"
+
 # Diagnose-Examples: dürfen nur mit ihrem Feature gebaut werden,
 # damit `cargo build`/`cargo test` ohne Feature den Produktionspfad sauber
 # kompilieren (Prototyp-Code bleibt einkompilierbar-getrennt).

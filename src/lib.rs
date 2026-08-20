@@ -71,6 +71,43 @@ pub struct Database {
     format_version: u32,
 }
 
+/// Eine Segment-Information aus dem Manifest (Snapshot, nicht mutierend).
+#[derive(Debug, Clone)]
+pub struct SegmentInfo {
+    pub file_id: u64,
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
+    pub records: u64,
+}
+
+/// Strukturelle Zusammenfassung des Manifests (Snapshot, nicht mutierend).
+#[derive(Debug, Clone)]
+pub struct ManifestSummary {
+    pub next_table_id: u64,
+    pub levels: Vec<Vec<u64>>,
+    pub segments: Vec<SegmentInfo>,
+    pub level_count: usize,
+}
+
+/// Detail-Informationen zu einer physischen Tabelle.
+#[derive(Debug, Clone)]
+pub struct TableInfo {
+    pub id: u64,
+    pub level: usize,
+    pub path: PathBuf,
+    pub num_records: u64,
+    pub key_bounds_hex: String,
+    pub size_bytes: u64,
+}
+
+/// Kopie der wirksamen Compaction-/Engine-Optionen.
+#[derive(Debug, Clone, Copy)]
+pub struct DbOptionsView {
+    pub memtable_limit: usize,
+    pub l0_compact_threshold: usize,
+    pub segment_max_records: usize,
+}
+
 impl Database {
     /// Öffnet (oder erstellt) eine Datenbank in `dir`. Spielt beim Start den
     /// WAL neu und rekonstruiert den SSTable-Bestand aus dem Manifest.
@@ -712,6 +749,154 @@ impl Database {
         self.format_version
     }
 
+    /// Strukturelle Zusammenfassung des Manifests (Snapshot, keine Mutation).
+    pub fn manifest_summary(&self) -> ManifestSummary {
+        ManifestSummary {
+            next_table_id: self.manifest.next_table_id,
+            levels: self.manifest.levels.clone(),
+            segments: self
+                .manifest
+                .segments
+                .iter()
+                .map(|s| SegmentInfo {
+                    file_id: s.file_id,
+                    min_key: s.min_key.clone(),
+                    max_key: s.max_key.clone(),
+                    records: s.records,
+                })
+                .collect(),
+            level_count: self.manifest.levels.len(),
+        }
+    }
+
+    /// Detail-Informationen zu jeder physischen Tabelle (Record-Count,
+    /// Key-Range als Hex, Dateigröße). Zuverlässig via `TableReader`.
+    pub fn table_infos(&self) -> Result<Vec<TableInfo>> {
+        let mut out = Vec::new();
+        let l0: Vec<u64> = self.manifest.levels.get(0).cloned().unwrap_or_default();
+        for &id in &l0 {
+            out.push(self.table_info(id, 0)?);
+        }
+        for seg in &self.manifest.segments {
+            out.push(self.table_info(seg.file_id, 1)?);
+        }
+        Ok(out)
+    }
+
+    fn table_info(&self, id: u64, level: usize) -> Result<TableInfo> {
+        let path = self.table_path(id);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut num_records = 0u64;
+        let mut key_bounds_hex = String::new();
+        if let Ok(reader) = sstable::TableReader::open(&path) {
+            num_records = reader.num_records();
+            if let Some((a, b)) = reader.key_bounds() {
+                key_bounds_hex = format!("{}..{}", hex_encode(a), hex_encode(b));
+            }
+        }
+        Ok(TableInfo {
+            id,
+            level,
+            path,
+            num_records,
+            key_bounds_hex,
+            size_bytes: size,
+        })
+    }
+
+    /// Größe der `wal.log`-Datei in Bytes (0 falls nicht vorhanden).
+    pub fn wal_size(&self) -> u64 {
+        std::fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Gesamtgröße aller Dateien im DB-Verzeichnis in Bytes.
+    pub fn db_size(&self) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                if let Ok(meta) = e.metadata() {
+                    if meta.is_file() {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Kopie der wirksamen Compaction-/Engine-Optionen.
+    pub fn options_view(&self) -> DbOptionsView {
+        DbOptionsView {
+            memtable_limit: self.opts.memtable_limit,
+            l0_compact_threshold: self.opts.l0_compact_threshold,
+            segment_max_records: self.opts.segment_max_records,
+        }
+    }
+
+    /// Erzwingt eine vollständige Compaction (alle L0-Tabellen + alle
+    /// L1-Segmente -> frische L1-Segmente, Tombstones physisch entfernt).
+    ///
+    /// Durability-/Recovery-Vertrag: identisch zur bestehenden `compact()`:
+    /// Manifest-Commit (fsync + atomarer rename) erfolgt **vor** dem Löschen
+    /// der alten SSTables. Ein Crash mitten in `compact_full` lässt die alten,
+    /// vom alten Manifest referenzierten SSTables intakt -> DB bleibt
+    /// konsistent/öffbar. Scheitert das Einlesen einer Tabelle, bricht der
+    /// Aufruf ab, es wird nichts gelöscht, das Manifest bleibt unverändert.
+    pub fn compact_full(&mut self) -> Result<usize> {
+        // 1. MemTable vollständig persistieren, damit alles in SSTables liegt.
+        self.flush()?;
+
+        // 2. Alle Quell-Tabellen: L0 (neueste zuerst) + alle L1-Segmente.
+        let l0: Vec<u64> = self.manifest.levels.get(0).cloned().unwrap_or_default();
+        let old_segment_ids: Vec<u64> = self.manifest.segments.iter().map(|s| s.file_id).collect();
+        let mut input_ids: Vec<u64> = l0.iter().copied().rev().collect();
+        input_ids.extend(old_segment_ids.iter().copied());
+
+        let merged = self.merge_ids(&input_ids, true)?;
+
+        // 3. Deterministic Split in neue L1-Segmente.
+        let mut new_segments: Vec<SegmentMeta> = Vec::new();
+        for chunk in merged.chunks(self.opts.segment_max_records) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let id = self.write_table(chunk)?;
+            new_segments.push(SegmentMeta {
+                file_id: id,
+                min_key: chunk[0].0.clone(),
+                max_key: chunk[chunk.len() - 1].0.clone(),
+                records: chunk.len() as u64,
+            });
+        }
+        new_segments.sort_unstable_by(|a, b| a.min_key.cmp(&b.min_key));
+
+        // 4. Alte IDs merken, bevor das Manifest ersetzt wird.
+        let mut old_ids: Vec<u64> = l0;
+        old_ids.extend(old_segment_ids);
+
+        // 5. Manifest-COMMIT (fsync + rename) VOR dem Löschen der alten SSTables.
+        self.manifest.segments = new_segments;
+        while self.manifest.levels.len() < 1 {
+            self.manifest.levels.push(Vec::new());
+        }
+        self.manifest.levels[0] = Vec::new();
+        self.manifest.save(&self.manifest_path)?;
+        self.table_cache.clear();
+
+        // 6. Alte SSTables entfernen (nur nach erfolgreichem Commit).
+        for id in old_ids {
+            let _ = std::fs::remove_file(self.table_path(id));
+        }
+        Ok(self.manifest.segments.len())
+    }
+
+    /// Schließt die Datenbank OHNE Flush (rein lesend). Verhindert, dass der
+    /// `Drop` noch ein Flush/WAL-Sync auslöst. Für `inspect`/`stats`, die die
+    /// DB nicht mutieren dürfen.
+    pub fn close_without_flush(mut self) {
+        self.closed = true;
+    }
+
     pub fn level_tables(&self, level: usize) -> usize {
         if level == 1 {
             return self.manifest.segments.len();
@@ -753,6 +938,17 @@ impl Database {
 
 /// Best-Effort-Fallback: Flusht beim Verwerfen, wenn `close()` nicht explizit
 /// gerufen wurde. Fehler werden ignoriert — `close()` ist die zuverlässige API.
+/// Hilfsfunktion: Bytes als Kleinbuchstaben-Hex (für inspect-Ausgabe).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 impl Drop for Database {
     fn drop(&mut self) {
         if !self.closed {
