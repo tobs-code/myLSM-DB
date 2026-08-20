@@ -193,11 +193,20 @@ impl Database {
     }
 
     /// Löscht einen Schlüssel (Tombstone).
+    ///
+    /// Nicht durable, solange die Operation returniert — der Write wird erst
+    /// nach einem erfolgreichen `flush()`/`close()` dauerhaft (deferred
+    /// durability). Transaktionen sind nach `commit()` durable.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.put_internal(key, None)
     }
 
     /// Setzt einen Wert. Append-only in WAL + MemTable, Flush bei Größenlimit.
+    ///
+    /// Nicht durable, solange die Operation returniert: der Write wird erst
+    /// nach einem erfolgreichen `flush()`/`close()` dauerhaft (deferred
+    /// durability). Für Durability `flush()`/`close()` nutzen; Transaktionen
+    /// sind nach `commit()` durable.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_internal(key, Some(value))
     }

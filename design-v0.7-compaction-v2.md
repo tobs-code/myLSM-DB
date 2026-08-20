@@ -2283,4 +2283,29 @@ Manifestformat. `InvalidFormat` ist der bestehende korrekte Fehlervertrag.
 **WAL-Durability (`put`/`delete` ohne `fsync`) bleibt bewusst separat** und
 ist nicht Teil dieses Fixes.
 
+### 30.12 WAL-Durability-Vertrag (Auditergebnis, F-WAL)
+
+Read-only Audit des WAL-Durability-Verhaltens (kein Code-Change). Ergebnis:
+
+- **Kein Correctness-Bug**, **kein Durability-Vertragsbruch**.
+- WAL-Recovery ist konsistent und idempotent (CRC-Stop beim ersten Defekt,
+  uncommittete Transaktionen verworfen, `next_tx_id = max+1` verhindert
+  Wiederverwendung).
+- Direct `put`/`delete` haben **bewusst deferred durability**: nicht durable
+  beim Return, durable nach `flush()`/`close()`.
+- Transaction `commit` ist der Durability-Punkt (per-commit `fsync`).
+- Ein `fsync` pro Direct-Write wäre eine Architektur-/Performance-Entscheidung,
+  kein Fix.
+
+**Expliziter öffentlicher Vertrag:**
+
+> Direct writes (`put`/`delete`) are not durable when the operation returns.
+> They become durable after a successful `flush()` or `close()`. Transactions
+> become durable after a successful `commit()`. Applications requiring
+> durability must use these explicit durability boundaries.
+
+Dokumentiert an `Database::put`/`delete` (Doc-Comments, lib.rs) und hier.
+WAL-Zweig damit **geschlossen** — kein neuer technischer Zweig ohne
+konkreten neuen Befund.
+
 **Kein Commit. Kein Produktionscode geändert.**
