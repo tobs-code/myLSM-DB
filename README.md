@@ -663,3 +663,32 @@ Der Kern des Storage-Read-Pfads ist nach den Fixes bei 100k gesund: kein Grund, 
 | **v0.7.2** -fertig- | **Lazy-Read-Komplexität:** `scan_stream` nutzt den `table_cache`, `TableReader::fork()`/`Arc`-Reader-Sharing — behebt O(N²) bei vielen SSTables |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.
+
+---
+
+## Aktueller Status — Stand Handover-Audit (2026-08-20)
+
+> Kanonische Referenzen (siehe `design-v0.7-compaction-v2.md`):
+
+| Referenz | Bedeutung |
+|---|---|
+| `d6d5916` | **Produktionsbaseline** — unverändert, kein produktiver Code von diesem Stand abgewichen |
+| `6b65191` | **Diagnose-Freeze v0.9/v0.10** — v0.10 Field-Projection untersucht und verworfen (Real-Workload: 3–4 Felder/Entity, 100 % Full-Reads) |
+| `cf382ca` | **Handover-Audit** — Vorgänger-LLM-Arbeit übernommen und klassifiziert (§27–§28) |
+
+**Abgeschlossene Diagnosekette (eigene Linie):**
+- **v0.9 → v0.9a → v0.9b:** Read-Hotspot lokalisiert (`get` = 82 % der Read-Kosten, skaliert mit Feldanzahl).
+- **v0.10:** Field-Projection-Prototyp gebaut (G1–G8 Korrektheitsgates grün), aber **wirtschaftlich verworfen** — isolierter Gewinn nur bei `requested_fields << entity_fields`; im realen Traffic (volle Reads) langsamer als `get`.
+
+**Handover-Audit der Vorgänger-Arbeit (§27–§28):**
+- `value_cache` (v0.7-write-cache): technisch korrekt (Oracle-Tests grün, Invalidation vollständig), aber **isoliert 0–11 % Cache-Effekt** im non-tx Write-Pfad → wirtschaftlich nicht relevant, kein Produktionskandidat.
+- `compaction_v2` (12/12 Regressionstests): testet exakt die `d6d5916`-Compaction-Architektur, keine neue Logik.
+- `diag.rs` + `bench.rs`: funktionierende Diagnose-Infrastruktur, keine Produktionskopplung.
+- `bench-ir*`, `bench-v2`, `bench-v8`: historische Klasse-C-Artefakte (aktuell wegen fehlender Feature-Definitionen nicht baubar).
+
+**Invarianten:**
+- `d6d5916` bleibt Produktionsbaseline.
+- Kein Produktions-Merge aus der Diagnose/aus dem Audit.
+- Nächster Sprint erst bei **neuem konkreten Befund**, nicht vorab als "v0.11" deklariert.
+- Vorgänger-Working-Tree (modifizierte `src/`-Dateien, temporäre Artefakte) bleibt bewusst unangetastet.
+
