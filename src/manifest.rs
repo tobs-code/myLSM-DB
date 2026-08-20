@@ -118,7 +118,12 @@ impl Manifest {
                         .ok_or_else(|| Error::InvalidFormat("manifest L level".into()))?
                         .parse()
                         .map_err(|_| Error::InvalidFormat("manifest level".into()))?;
-                    let ids: Vec<u64> = parts.filter_map(|s| s.parse().ok()).collect();
+                    let ids: Vec<u64> = parts
+                        .map(|s| {
+                            s.parse::<u64>()
+                                .map_err(|_| Error::InvalidFormat(format!("manifest L id {s}")))
+                        })
+                        .collect::<Result<Vec<u64>>>()?;
                     while m.levels.len() <= level {
                         m.levels.push(Vec::new());
                     }

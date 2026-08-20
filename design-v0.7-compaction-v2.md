@@ -2257,4 +2257,30 @@ referenzierte SST nie gelöscht, Corrupt/missing referenzierte SST nicht als
 Garbage behandelt, `.manifest.tmp` entfernt, Fremd-`.sst` (nicht 6-stellig)
 übersprungen.
 
+### 30.11 Manifest-`L`-Zeilen-Parsing strikt (F.3–F.5)
+
+**F.3 Forensik:** `Manifest::load` parste `L`-Zeilen-IDs lenient via
+`filter_map(|s| s.parse().ok())` (manifest.rs), während `N`- und `S`-Zeilen
+strikt mit `Error::InvalidFormat` parsen. `validate()` prüft nur
+Segment-Überlappung/duplikate IDs, nicht ob jede `.sst` referenziert ist;
+`validate_open_state` prüft nur *referenzierte* Dateien. Folge: ein korrupter
+ID-Token in einer `L`-Zeile wurde **still** aus der Level-Liste gelöscht →
+live-Tabelle unreferenziert → `open()` gelingt → Daten lautlos weg → `gc()`
+löscht permanent. Konkreter, reproduzierbarer Pfad zu stillem Datenverlust.
+
+**F.4 Regression (`tests/manifest_corruption.rs`):** korrupte `L`-ID
+(`L 0 1 x5`) → `Manifest::load` **und** `Database::open` müssen
+`Error::InvalidFormat` liefern (nicht `Corrupt` über eine verfälschte
+Level-Liste, und kein stiller Drop). Da `open()` scheitert, existiert kein
+`Database`-Handle → `gc()` ist in diesem Zustand strukturell nicht
+aufrufbar.
+
+**F.5 Minimaler Fix:** nur der Parser — `L`-IDs strikt parsen
+(`map(|s| s.parse::<u64>().map_err(InvalidFormat)).collect::<Result<_>>()?`),
+analog zur `S`-Zeile. Keine Änderung an `validate_open_state`, GC oder
+Manifestformat. `InvalidFormat` ist der bestehende korrekte Fehlervertrag.
+
+**WAL-Durability (`put`/`delete` ohne `fsync`) bleibt bewusst separat** und
+ist nicht Teil dieses Fixes.
+
 **Kein Commit. Kein Produktionscode geändert.**
