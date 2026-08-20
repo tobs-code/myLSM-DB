@@ -529,6 +529,67 @@ impl Database {
         Ok(())
     }
 
+    /// Bereinigt verwaiste (Orphan-)SSTables. **Expliziter Maintenance-Schritt**,
+    /// keine automatische Bereinigung beim Oeffnen (siehe Design-Doc §30.10).
+    ///
+    /// Sicherheitsregeln:
+    /// - Nur `.sst`-Dateien, deren `file_id` **nicht** im committed Manifest
+    ///   (`self.manifest`, identisch mit `MANIFEST` auf Disk) steht, werden
+    ///   geloescht. Referenzierte Dateien werden niemals angetastet.
+    /// - `.manifest.tmp` (nie recovery-relevant) wird ebenfalls entfernt.
+    /// - Keine Aenderung am Manifest, keine Compaction.
+    ///
+    /// Erfordert exklusiven Zugriff: der `&mut self`-Borrow stellt sicher,
+    /// dass waehrend `gc()` kein gleichzeitiger Lese-/Schreibzugriff auf
+    /// dieselbe DB-Instanz besteht (In-Process). Cross-Process-Locking ist
+    /// bewusst nicht implementiert.
+    ///
+    /// Rueckgabe: Anzahl geloeschter `.sst`-Orphans.
+    pub fn gc(&mut self) -> Result<usize> {
+        use std::collections::HashSet;
+        let referenced: HashSet<u64> = self.manifest.all_ids().into_iter().collect();
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            // Nur echte `.sst`-Dateien betrachten.
+            if path.extension().and_then(|e| e.to_str()) != Some("sst") {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Unsere Dateien folgen exakt dem Schema `{:06}.sst` (6 Ziffern,
+            // zero-padded). Fremde/anders benannte `.sst` werden uebersprungen
+            // (Opt-in-Maintenance-Risiko).
+            if stem.len() != 6 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let id: u64 = match stem.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if referenced.contains(&id) {
+                continue; // referenziert -> niemals anfassen
+            }
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        }
+
+        // Stray `.manifest.tmp` ist nie recovery-relevant -> immer gefahrlos
+        // entfernen (nicht in `removed` gezaehlt, da kein `.sst`).
+        let tmp = self.manifest_path.with_extension("manifest.tmp");
+        if tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        // Cache von entfernten (unreferenzierten) Eintraegen befreien.
+        self.table_cache.retain(|id, _| referenced.contains(id));
+
+        Ok(removed)
+    }
+
     /// Mergt die gegebenen Tabellen-IDs in der uebergebenen Reihenfolge
     /// **neueste zuerst** (erste Quelle gewinnt bei Key-Kollision = LWW).
     /// Der Aufrufer garantiert die Ordnung: L0-Tabellen (desc nach ID) vor
