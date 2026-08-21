@@ -18,10 +18,10 @@
 
 #![cfg(feature = "bench-diag")]
 
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
 use my_lsm_db::index::FindOp;
-use my_lsm_db::Options;
 
 fn mk(age: i64, score: i64) -> Entity {
     let mut e = Entity::new();
@@ -42,11 +42,7 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 fn fingerprint(store: &mut EntityStore, ids: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     for id in ids {
-        let ent = store
-            .collection("users")
-            .unwrap()
-            .get(id)
-            .unwrap();
+        let ent = store.collection("users").unwrap().get(id).unwrap();
         out.push(format!("get({})={:?}", id, ent));
     }
     for field in ["age", "score"] {
@@ -79,10 +75,7 @@ fn both<W: FnOnce(&mut EntityStore), C: FnOnce(&mut EntityStore)>(
 ) {
     w(warm);
     c(cold);
-    let (fw, fc) = (
-        fingerprint(warm, ids),
-        fingerprint(cold, ids),
-    );
+    let (fw, fc) = (fingerprint(warm, ids), fingerprint(cold, ids));
     assert_eq!(fw, fc, "Warm-Pfad (Old-Value-Cache) wich vom Cold-Pfad ab");
 }
 
@@ -111,66 +104,115 @@ fn warm_put_matches_cold_transaction_oracle() {
     let mut cold = EntityStore::open(cdir.path()).unwrap();
     for s in [&mut warm, &mut cold] {
         s.collection("users").unwrap().create_index("age").unwrap();
-        s.collection("users").unwrap()
+        s.collection("users")
+            .unwrap()
             .create_index("score")
             .unwrap();
     }
     let ids = ["alice", "bob"];
 
     // 1) initial
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "alice", &mk(30, 90));
-        put(s, "bob", &mk(25, 70));
-    }, |s| {
-        tx_put(s, "alice", &mk(30, 90));
-        tx_put(s, "bob", &mk(25, 70));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "alice", &mk(30, 90));
+            put(s, "bob", &mk(25, 70));
+        },
+        |s| {
+            tx_put(s, "alice", &mk(30, 90));
+            tx_put(s, "bob", &mk(25, 70));
+        },
+    );
     // 2) beide Felder ändern (Cache-Hit auf age+score)
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "alice", &mk(31, 85));
-    }, |s| {
-        tx_put(s, "alice", &mk(31, 85));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "alice", &mk(31, 85));
+        },
+        |s| {
+            tx_put(s, "alice", &mk(31, 85));
+        },
+    );
     // 3) nur score ändern
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "bob", &mk(25, 72));
-    }, |s| {
-        tx_put(s, "bob", &mk(25, 72));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "bob", &mk(25, 72));
+        },
+        |s| {
+            tx_put(s, "bob", &mk(25, 72));
+        },
+    );
     // 4) Feld entfernen (Stale-Removal + Index-Delete)
     let mut e = mk(31, 85);
     e.fields.retain(|(n, _)| n != "score");
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "alice", &e);
-    }, |s| {
-        tx_put(s, "alice", &e);
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "alice", &e);
+        },
+        |s| {
+            tx_put(s, "alice", &e);
+        },
+    );
     // 5) Feld wieder hinzufügen (neuer Index-Eintrag)
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "alice", &mk(40, 50));
-    }, |s| {
-        tx_put(s, "alice", &mk(40, 50));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "alice", &mk(40, 50));
+        },
+        |s| {
+            tx_put(s, "alice", &mk(40, 50));
+        },
+    );
     // 6) Delete beider
-    both(&mut warm, &mut cold, &ids, |s| {
-        del(s, "alice");
-        del(s, "bob");
-    }, |s| {
-        tx_del(s, "alice");
-        tx_del(s, "bob");
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            del(s, "alice");
+            del(s, "bob");
+        },
+        |s| {
+            tx_del(s, "alice");
+            tx_del(s, "bob");
+        },
+    );
     // 7) Delete → Reinsert
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "alice", &mk(33, 88));
-    }, |s| {
-        tx_put(s, "alice", &mk(33, 88));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "alice", &mk(33, 88));
+        },
+        |s| {
+            tx_put(s, "alice", &mk(33, 88));
+        },
+    );
     // 8) weitere Entity interleaved
-    both(&mut warm, &mut cold, &ids, |s| {
-        put(s, "bob", &mk(25, 70));
-    }, |s| {
-        tx_put(s, "bob", &mk(25, 70));
-    });
+    both(
+        &mut warm,
+        &mut cold,
+        &ids,
+        |s| {
+            put(s, "bob", &mk(25, 70));
+        },
+        |s| {
+            tx_put(s, "bob", &mk(25, 70));
+        },
+    );
 }
 
 #[test]
@@ -201,12 +243,14 @@ fn reopen_clears_cache_then_cold_fallback_is_correct() {
         .find("age", FindOp::Eq(Value::Int(30)))
         .unwrap();
     assert_eq!(sorted(old), Vec::<String>::new());
-    assert!(store
-        .collection("users")
-        .unwrap()
-        .get("alice")
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .collection("users")
+            .unwrap()
+            .get("alice")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -255,18 +299,24 @@ fn updates_across_flush_and_compaction_stay_consistent() {
     // Der Index-Stand (via Cache-getriebene Diffs) muss exakt dem Datenstand
     // entsprechen. Jede Abweichung heißt: falscher Old-Value → falscher
     // Index-Diff → driftende Index-Einträge.
-    let via_index = sorted(store
-        .collection("users")
-        .unwrap()
-        .find("age", FindOp::Between(Value::Int(20), Value::Int(100)))
-        .unwrap());
+    let via_index = sorted(
+        store
+            .collection("users")
+            .unwrap()
+            .find("age", FindOp::Between(Value::Int(20), Value::Int(100)))
+            .unwrap(),
+    );
     let via_scan: Vec<String> = store
         .scan_collection("users")
         .unwrap()
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    assert_eq!(sorted(via_scan), via_index, "Index driftete vom Datenstand ab");
+    assert_eq!(
+        sorted(via_scan),
+        via_index,
+        "Index driftete vom Datenstand ab"
+    );
 }
 
 #[test]

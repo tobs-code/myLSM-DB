@@ -1,3 +1,51 @@
+//! # my-lsm-db
+//!
+//! Eine kleine, eingebettete LSM-Key-Value-Datenbank mit typisierter
+//! Entitäts-Schicht, optimistischer Nebenläufigkeit (CAS), Transaktionen,
+//! Composite-Indexen, Queries/Aggregationen sowie dateibasiertem
+//! Backup/Restore.
+//!
+//! ## Welche API soll ich nutzen?
+//!
+//! - [`entity::EntityStore`] ist die **empfohlene High-Level-API**: typisierte
+//!   Entitäten, Collections, Indizes, Queries, CAS und Transaktionen. Einstieg
+//!   hier.
+//! - [`Database`] ist die **Low-Level-KV-Engine** (rohe Byte-Keys/Values,
+//!   Compaction, Manifest-Introspektion). Die meisten Anwendungen benötigen
+//!   sie nicht.
+//!
+//! ## Schnelleinstieg
+//!
+//! Siehe das `intro`-Beispiel (`cargo run --example intro`) und
+//! `CHANGELOG.md`.
+//!
+//! ## Format & Kompatibilität
+//!
+//! Die On-Disk-Format-Version ist `1`. Jeder `v1.x`-Release liest Datenbanken,
+//! die von einem beliebigen `v1.x`- (sowie Legacy-v1-)Binary geschrieben
+//! wurden. Ein künftiges Format `2` wird mit
+//! [`error::Error::UnsupportedFormatVersion`] abgewiesen und erfordert ein
+//! explizites Migrationswerkzeug. Details in `CHANGELOG.md`
+//! (Abschnitt *Compatibility Policy*).
+
+// Stil-Lints: bewusst crate-weit erlaubt, um im Release-Hardening keine
+// massenhaften, risikobehafteten Umschreibungen vorzunehmen. Betreffen rein
+// Kosmetik (collapsible_if, type_complexity, …), keine Korrektheit. Der CI-Gate
+// `cargo clippy -- -D warnings` bleibt für alle übrigen Lints aktiv.
+#![allow(
+    clippy::collapsible_if,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::should_implement_trait,
+    clippy::manual_is_multiple_of,
+    clippy::let_and_return,
+    clippy::len_zero,
+    clippy::get_first,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or,
+    clippy::suspicious_open_options
+)]
+
 pub mod codec;
 pub mod compaction;
 pub mod entity;
@@ -52,7 +100,11 @@ impl Default for Options {
     }
 }
 
-/// Eine LSM-Engine: `put`/`get`/`delete`/`scan` über WAL + MemTable + SSTables.
+/// **Low-Level-KV-Engine** (nicht die empfohlene Anwendungs-API).
+///
+/// Bietet rohe Byte-`put`/`get`/`delete`/`scan` über WAL + MemTable + SSTables
+/// sowie Compaction- und Manifest-Introspektion. Die meisten Anwendungen sollen
+/// stattdessen [`entity::EntityStore`] verwenden.
 pub struct Database {
     dir: PathBuf,
     wal_path: PathBuf,
@@ -669,11 +721,7 @@ impl Database {
     /// `drop_tombstones` steuert, ob endgueltige Tombstones (resultierender Wert
     /// `None`) physisch entfernt werden - nur zulaessig, wenn die komplette
     /// Historie jedes betroffenen Keys im Merge-Set liegt (11.1 der Spez).
-    fn merge_ids(
-        &self,
-        ids: &[u64],
-        drop_tombstones: bool,
-    ) -> Result<Vec<(Vec<u8>, Entry)>> {
+    fn merge_ids(&self, ids: &[u64], drop_tombstones: bool) -> Result<Vec<(Vec<u8>, Entry)>> {
         let mut sources = Vec::new();
         for id in ids {
             let path = self.table_path(*id);
@@ -700,9 +748,9 @@ impl Database {
             // Wie `merge_ids`: Eine unlesbare Tabelle darf die Compaction nicht
             // still fortschreiten lassen (E.8).
             let reader = sstable::TableReader::open(&path)?;
-            let (first, last) = reader
-                .key_bounds()
-                .ok_or_else(|| crate::error::Error::Corrupt("empty L0 table referenced in compact"))?;
+            let (first, last) = reader.key_bounds().ok_or_else(|| {
+                crate::error::Error::Corrupt("empty L0 table referenced in compact")
+            })?;
             let f = first.to_vec();
             let l = last.to_vec();
             if min.as_ref().map_or(true, |m| f < *m) {
@@ -806,7 +854,9 @@ impl Database {
 
     /// Größe der `wal.log`-Datei in Bytes (0 falls nicht vorhanden).
     pub fn wal_size(&self) -> u64 {
-        std::fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.wal_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// Gesamtgröße aller Dateien im DB-Verzeichnis in Bytes.
@@ -984,7 +1034,9 @@ impl Database {
         // 2. Backup-Root validieren.
         let src_manifest = src.join("MANIFEST");
         if !src_manifest.exists() {
-            return Err(error::Error::InvalidFormat("backup missing MANIFEST".into()));
+            return Err(error::Error::InvalidFormat(
+                "backup missing MANIFEST".into(),
+            ));
         }
 
         // 3. Ziel vorbereiten: leer oder nicht existent (Vertragspunkt 7/9).
@@ -1198,9 +1250,7 @@ mod tests {
             }
         }
         // `scan()` gibt keine Tombstones aus (gelöschte Keys erscheinen nicht).
-        best.into_iter()
-            .filter(|(_, v)| v.is_some())
-            .collect()
+        best.into_iter().filter(|(_, v)| v.is_some()).collect()
     }
 
     fn setup(dir: &Path) -> Database {

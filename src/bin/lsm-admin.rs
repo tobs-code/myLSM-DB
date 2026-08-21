@@ -7,6 +7,18 @@
 //!
 //! Exit-Codes: 0 = ok, 1 = Laufzeitfehler (Open/Operation), 2 = Aufruffehler.
 
+// Stil-Lints bewusst erlaubt (siehe Begründung in src/lib.rs); betrifft nur
+// Kosmetik, keine Korrektheit. `cargo clippy -- -D warnings` bleibt sonst aktiv.
+#![allow(
+    clippy::collapsible_if,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::get_first,
+    clippy::ptr_arg,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_sort_by
+)]
+
 use std::env;
 use std::path::PathBuf;
 use std::process;
@@ -170,8 +182,16 @@ fn cmd_stats(dir: &PathBuf) -> Result<(), i32> {
 
     let l0: usize = summary.levels.get(0).map(|v| v.len()).unwrap_or(0);
     let l1 = tables.iter().filter(|t| t.level == 1).count();
-    let l0_bytes: u64 = tables.iter().filter(|t| t.level == 0).map(|t| t.size_bytes).sum();
-    let l1_bytes: u64 = tables.iter().filter(|t| t.level == 1).map(|t| t.size_bytes).sum();
+    let l0_bytes: u64 = tables
+        .iter()
+        .filter(|t| t.level == 0)
+        .map(|t| t.size_bytes)
+        .sum();
+    let l1_bytes: u64 = tables
+        .iter()
+        .filter(|t| t.level == 1)
+        .map(|t| t.size_bytes)
+        .sum();
     let o = db.options_view();
 
     println!("db-size: {} bytes", db.db_size());

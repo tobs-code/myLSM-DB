@@ -566,7 +566,13 @@ fn projection_basic_order_and_missing() {
     e2.insert("nick", Value::Null);
     col.put("u2", &e2).unwrap();
 
-    let got = execute_proj(&mut store, None, None, None, &["name", "age", "active", "missing"]);
+    let got = execute_proj(
+        &mut store,
+        None,
+        None,
+        None,
+        &["name", "age", "active", "missing"],
+    );
 
     let u1 = got.iter().find(|(id, _)| id == "u1").unwrap().1.clone();
     assert_eq!(u1.field("name"), Some(&Value::String("alice".into())));
@@ -582,7 +588,10 @@ fn projection_basic_order_and_missing() {
     // u2 hat nur "name"; alle anderen (auch present-Null "nick") sind nicht
     // angefordert → nur das eine Feld.
     let u2 = got.iter().find(|(id, _)| id == "u2").unwrap().1.clone();
-    assert_eq!(u2.fields, vec![("name".into(), Value::String("bob".into()))]);
+    assert_eq!(
+        u2.fields,
+        vec![("name".into(), Value::String("bob".into()))]
+    );
 }
 
 #[test]
@@ -624,7 +633,10 @@ fn projection_and_aggregation_exclusive() {
 
     // Aggregation gesetzt, aber execute_query → Fehler.
     let b = store.query("users").unwrap().aggregate(Aggregate::Count);
-    assert!(matches!(store.execute_query(b), Err(Error::InvalidArgument(_))));
+    assert!(matches!(
+        store.execute_query(b),
+        Err(Error::InvalidArgument(_))
+    ));
 
     // Projektion gesetzt, aber execute_aggregate → Fehler.
     let b = store.query("users").unwrap().project(&["age"]);
@@ -682,7 +694,11 @@ fn aggregation_sum_saturates_overflow() {
         col.put(&format!("u{}", rng_id()), &e).unwrap();
     }
     let got = execute_agg(&mut store, None, None, None, &Aggregate::Sum("age".into()));
-    assert_eq!(got, Some(Value::Int(i64::MAX)), "sum must saturate at i64::MAX");
+    assert_eq!(
+        got,
+        Some(Value::Int(i64::MAX)),
+        "sum must saturate at i64::MAX"
+    );
 
     let dir2 = tempfile::tempdir().unwrap();
     let mut s2 = EntityStore::open(dir2.path()).unwrap();
@@ -693,7 +709,11 @@ fn aggregation_sum_saturates_overflow() {
         c.put(&format!("u{}", rng_id()), &e).unwrap();
     }
     let got = execute_agg(&mut s2, None, None, None, &Aggregate::Sum("age".into()));
-    assert_eq!(got, Some(Value::Int(i64::MIN)), "sum must saturate at i64::MIN");
+    assert_eq!(
+        got,
+        Some(Value::Int(i64::MIN)),
+        "sum must saturate at i64::MIN"
+    );
 }
 
 // Kleiner Hilfszähler, um eindeutige IDs in Schleifen zu erzeugen.
@@ -763,19 +783,43 @@ fn aggregation_float_promotion_and_avg() {
 
     // Ein Float vorhanden → Summe/Limits werden zu Float64 promoviert.
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Sum("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Sum("score".into())
+        ),
         Some(Value::Float(35.5))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Avg("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Avg("score".into())
+        ),
         Some(Value::Float(35.5 / 3.0))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Min("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Min("score".into())
+        ),
         Some(Value::Float(5.5))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Max("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Max("score".into())
+        ),
         Some(Value::Float(20.0))
     );
 
@@ -814,19 +858,43 @@ fn aggregation_nan_inf_skipped() {
     col.put("u3", &e).unwrap();
 
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Sum("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Sum("score".into())
+        ),
         Some(Value::Int(7))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Min("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Min("score".into())
+        ),
         Some(Value::Int(7))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Max("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Max("score".into())
+        ),
         Some(Value::Int(7))
     );
     assert_eq!(
-        execute_agg(&mut store, None, None, None, &Aggregate::Avg("score".into())),
+        execute_agg(
+            &mut store,
+            None,
+            None,
+            None,
+            &Aggregate::Avg("score".into())
+        ),
         Some(Value::Float(7.0))
     );
     // Nur NaN + Inf → alle numerischen Werte übersprungen.
@@ -937,7 +1005,11 @@ fn random_projection_matches_oracle() {
         if sort.is_some() {
             assert_eq!(got, exp, "proj sorted mismatch: {tag}");
         } else {
-            assert_eq!(sorted_by_id(got), sorted_by_id(exp), "proj set mismatch: {tag}");
+            assert_eq!(
+                sorted_by_id(got),
+                sorted_by_id(exp),
+                "proj set mismatch: {tag}"
+            );
         }
     }
 }

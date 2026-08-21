@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-gate:
+    name: Release gate (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy, rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Docs
+        run: cargo doc --no-deps

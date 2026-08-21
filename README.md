@@ -829,3 +829,28 @@ Siehe [`OPERATIONS.md`](./OPERATIONS.md) für:
 - **Concurrency-Grenze:** kein Cross-Process-Locking / Multi-Writer.
 - **Backlog:** `Bulk Index Build` als C-Kandidat (keine v1.4-Verpflichtung).
 
+---
+
+## Format & Kompatibilität
+
+Die On-Disk-Format-Version ist `1` (`FORMAT_VERSION`). Die vollständige
+Produktregel — inkl. Verhalten bei einem künftigen Format `2` und der
+Backup/Restore-Versionprüfung — steht in [`CHANGELOG.md`](./CHANGELOG.md)
+(Abschnitt *Compatibility Policy*). Kurzfassung:
+
+- **v1.x lesbar:** jeder v1.x-Binary liest Datenbanken von einem beliebigen
+  v1.x- oder Legacy-v1-Binary (Migration-by-read beim Öffnen ohne `VERSION`).
+- **Format 2 (zukünftig):** wird **nicht** lesend unterstützt; die Engine
+  liefert `UnsupportedFormatVersion` und lässt die DB unverändert. Ein Upgrade
+  erfolgt ausschließlich über ein explizites, separates Migrationswerkzeug —
+  niemals durch einen stillen Schreibzugriff der Engine.
+
+## Schnelleinstieg
+
+```sh
+cargo run --example intro      # open → put/get → query → backup/restore
+```
+
+Die empfohlene Anwendungs-API ist [`EntityStore`](./src/entity.rs); die rohe
+KV-Engine [`Database`](./src/lib.rs) bleibt für Low-Level-Zugriffe verfügbar.
+

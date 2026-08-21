@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use my_lsm_db::Database;
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
 use my_lsm_db::error::Error as DbError;
 use my_lsm_db::index::FindOp;
-use my_lsm_db::Database;
-use my_lsm_db::Options;
 
 /// Pfad zum gebauten `lsm-admin`-Binary (wie in tests/cli.rs).
 fn bin() -> std::path::PathBuf {
@@ -22,7 +22,11 @@ fn bin() -> std::path::PathBuf {
         .parent()
         .and_then(|p| p.parent())
         .expect("profile dir from current_exe");
-    let name = if cfg!(windows) { "lsm-admin.exe" } else { "lsm-admin" };
+    let name = if cfg!(windows) {
+        "lsm-admin.exe"
+    } else {
+        "lsm-admin"
+    };
     profile_dir.join(name)
 }
 
@@ -72,7 +76,11 @@ fn make_indexed_db(dir: &Path) {
 
 fn collect(dir: &Path) -> BTreeMap<String, Entity> {
     let mut store = EntityStore::open(dir).unwrap();
-    store.scan_collection("users").unwrap().into_iter().collect()
+    store
+        .scan_collection("users")
+        .unwrap()
+        .into_iter()
+        .collect()
 }
 
 fn index_find(dir: &Path, field: &str, op: FindOp) -> Vec<String> {
@@ -204,7 +212,10 @@ fn backup_flushes_pending_writes() {
     assert_eq!(after.len(), 3);
     for i in 0..3u32 {
         let e = after.get(&format!("e{i}")).expect("pending entity present");
-        assert_eq!(e.field("name"), Some(&Value::String(format!("pending-{i}"))));
+        assert_eq!(
+            e.field("name"),
+            Some(&Value::String(format!("pending-{i}")))
+        );
     }
 }
 
@@ -250,7 +261,10 @@ fn restore_into_existing_target_errors() {
     make_data_db(&existing);
 
     let res = Database::restore(&bak, &existing);
-    assert!(res.is_err(), "restore darf nicht stillschweigend überschreiben");
+    assert!(
+        res.is_err(),
+        "restore darf nicht stillschweigend überschreiben"
+    );
 }
 
 // 8. Beschädigtes/unvollständiges Backup -> open() scheitert.

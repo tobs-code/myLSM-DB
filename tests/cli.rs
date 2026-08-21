@@ -8,9 +8,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
-use my_lsm_db::Options;
 
 /// Pfad zum gebauten `lsm-admin`-Binary. Cargo setzt
 /// `CARGO_BIN_EXE_LSM_ADMIN` nur unzuverlässig; wir leiten ihn aus der
@@ -21,7 +21,11 @@ fn bin() -> std::path::PathBuf {
         .parent()
         .and_then(|p| p.parent())
         .expect("profile dir from current_exe");
-    let name = if cfg!(windows) { "lsm-admin.exe" } else { "lsm-admin" };
+    let name = if cfg!(windows) {
+        "lsm-admin.exe"
+    } else {
+        "lsm-admin"
+    };
     profile_dir.join(name)
 }
 
@@ -49,7 +53,11 @@ fn make_db(dir: &Path) {
 
 fn collect(dir: &Path) -> BTreeMap<String, Entity> {
     let mut store = EntityStore::open(dir).unwrap();
-    store.scan_collection("users").unwrap().into_iter().collect()
+    store
+        .scan_collection("users")
+        .unwrap()
+        .into_iter()
+        .collect()
 }
 
 /// (Name, Größe) aller Dateien im Verzeichnis, sortiert — zum
@@ -76,7 +84,11 @@ fn cli_inspect_multi_level() {
         .args(["inspect", "--dir", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
 
     assert!(s.contains("format-version: 1"), "got:\n{s}");
@@ -97,7 +109,11 @@ fn cli_stats_counts() {
         .args(["stats", "--dir", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
 
     assert!(s.contains("db-size:"), "got:\n{s}");
@@ -120,7 +136,11 @@ fn cli_compact_preserves_data() {
         .args(["compact", "--dir", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("compacted:"),
         "got: {}",
@@ -146,10 +166,17 @@ fn cli_gc_removes_orphans() {
         .args(["gc", "--dir", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("removed 1"), "got: {s}");
-    assert!(!dir.path().join("999999.sst").exists(), "orphan should be gone");
+    assert!(
+        !dir.path().join("999999.sst").exists(),
+        "orphan should be gone"
+    );
 
     // Referenzierte Daten bleiben intakt.
     let entities = collect(dir.path());

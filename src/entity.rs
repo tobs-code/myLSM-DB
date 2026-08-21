@@ -131,7 +131,7 @@ fn apply_patch(entity: &mut Entity, patch: &[Patch]) -> Result<()> {
                     None => {
                         return Err(Error::InvalidArgument(format!(
                             "increment on absent field '{name}'"
-                        )))
+                        )));
                     }
                     Some(Value::Int(c)) => match delta {
                         Value::Int(d) => {
@@ -142,7 +142,7 @@ fn apply_patch(entity: &mut Entity, patch: &[Patch]) -> Result<()> {
                         _ => {
                             return Err(Error::InvalidArgument(format!(
                                 "increment delta for '{name}' must be Int"
-                            )))
+                            )));
                         }
                     },
                     Some(Value::Float(c)) => match delta {
@@ -154,13 +154,13 @@ fn apply_patch(entity: &mut Entity, patch: &[Patch]) -> Result<()> {
                         _ => {
                             return Err(Error::InvalidArgument(format!(
                                 "increment delta for '{name}' must be Float"
-                            )))
+                            )));
                         }
                     },
                     Some(other) => {
                         return Err(Error::InvalidArgument(format!(
                             "increment on non-numeric field '{name}' (has {other:?})"
-                        )))
+                        )));
                     }
                 }
             }
@@ -178,8 +178,9 @@ fn core_cas_entity(
     schema: &mut Schema,
     m: &mut impl Mutator,
     hint: Option<&mut HashMap<(u32, Vec<u8>), HashSet<u32>>>,
-    #[cfg(feature = "bench-diag")]
-    value_cache: Option<&mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>>,
+    #[cfg(feature = "bench-diag")] value_cache: Option<
+        &mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>,
+    >,
     collection_id: u32,
     entity_id: &[u8],
     expected: &Expected,
@@ -190,7 +191,12 @@ fn core_cas_entity(
     let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
         .scan(Some(&start), end.as_deref())?
         .collect::<std::result::Result<_, _>>()?;
-    let current = core_get_entity(schema, &mut DirectScan { rows: &rows }, collection_id, entity_id)?;
+    let current = core_get_entity(
+        schema,
+        &mut DirectScan { rows: &rows },
+        collection_id,
+        entity_id,
+    )?;
 
     // 2. Bedingung prüfen.
     match expected {
@@ -250,7 +256,11 @@ fn core_cas_entity(
     Ok(new_entity)
 }
 
-/// Entitäts-Store: hält die KV-Engine + das persistente Schema.
+/// **Empfohlene High-Level-API** der Datenbank.
+///
+/// Hält die KV-Engine + das persistente Schema und bietet typisierte Entitäten,
+/// Collections, Indizes, Queries, CAS und Transaktionen. Dies ist der
+/// Einstiegspunkt für Anwendungen; die rohe Engine ist [`Database`].
 pub struct EntityStore {
     db: Database,
     schema: Schema,
@@ -460,10 +470,17 @@ fn composite_tuples(
 ) -> (Vec<Option<Value>>, Vec<Option<Value>>) {
     let new_tuple: Vec<Option<Value>> = fids
         .iter()
-        .map(|fid| written.iter().find(|(f, _)| *f == *fid).map(|(_, v)| (*v).clone()))
+        .map(|fid| {
+            written
+                .iter()
+                .find(|(f, _)| *f == *fid)
+                .map(|(_, v)| (*v).clone())
+        })
         .collect();
-    let old_tuple: Vec<Option<Value>> =
-        fids.iter().map(|fid| old_values.get(fid).cloned()).collect();
+    let old_tuple: Vec<Option<Value>> = fids
+        .iter()
+        .map(|fid| old_values.get(fid).cloned())
+        .collect();
     (new_tuple, old_tuple)
 }
 
@@ -488,8 +505,9 @@ fn core_put_entity(
     schema: &mut Schema,
     m: &mut impl Mutator,
     mut hint: Option<&mut HashMap<(u32, Vec<u8>), HashSet<u32>>>,
-    #[cfg(feature = "bench-diag")]
-    mut value_cache: Option<&mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>>,
+    #[cfg(feature = "bench-diag")] mut value_cache: Option<
+        &mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>,
+    >,
     collection_id: u32,
     entity_id: &[u8],
     entity: &Entity,
@@ -660,12 +678,8 @@ fn core_put_entity(
                 .iter()
                 .map(|o| ordering::encode_ordered(o.as_ref().unwrap()))
                 .collect();
-            let ik = keycodec::encode_composite_index_key(
-                collection_id,
-                *index_id,
-                &comps,
-                entity_id,
-            );
+            let ik =
+                keycodec::encode_composite_index_key(collection_id, *index_id, &comps, entity_id);
             m.put(&ik, &[])?;
         }
         // Alte (veraltete) Composite-Keys werden in Phase 3 gelöscht.
@@ -720,12 +734,8 @@ fn core_put_entity(
                 .iter()
                 .map(|o| ordering::encode_ordered(o.as_ref().unwrap()))
                 .collect();
-            let ik = keycodec::encode_composite_index_key(
-                collection_id,
-                *index_id,
-                &comps,
-                entity_id,
-            );
+            let ik =
+                keycodec::encode_composite_index_key(collection_id, *index_id, &comps, entity_id);
             m.delete(&ik)?;
         }
         let _ = new_complete;
@@ -775,8 +785,7 @@ fn core_delete_entity(
     let mut field_vals: HashMap<u32, Value> = HashMap::new();
     for (key, value_opt) in &rows {
         if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-            let needed =
-                indexed.contains(&field_id) || composite_field_ids.contains(&field_id);
+            let needed = indexed.contains(&field_id) || composite_field_ids.contains(&field_id);
             if needed {
                 if let Some(v) = value_opt {
                     if let Ok(val) = codec::decode(v) {
@@ -813,12 +822,8 @@ fn core_delete_entity(
             }
         }
         if complete {
-            let ik = keycodec::encode_composite_index_key(
-                collection_id,
-                *index_id,
-                &comps,
-                entity_id,
-            );
+            let ik =
+                keycodec::encode_composite_index_key(collection_id, *index_id, &comps, entity_id);
             m.delete(&ik)?;
         }
     }
@@ -1115,14 +1120,8 @@ impl EntityStore {
     /// Legt einen Composite-Index über ein Feld-Set an (v1.3). Bei einem einzigen
     /// Feld entspricht das einem Single-Field-Index. Statuswechsel wie
     /// [`create_index`].
-    pub fn create_composite_index(
-        &mut self,
-        collection_id: u32,
-        field_ids: &[u32],
-    ) -> Result<()> {
-        let id = self
-            .schema
-            .create_composite_index(collection_id, field_ids);
+    pub fn create_composite_index(&mut self, collection_id: u32, field_ids: &[u32]) -> Result<()> {
+        let id = self.schema.create_composite_index(collection_id, field_ids);
         self.schema.save(&self.schema_path)?; // BUILDING dauerhaft
         index::rebuild_composite(&mut self.db, collection_id, id, field_ids)?;
         self.schema.set_index_ready(id);
@@ -1141,15 +1140,8 @@ impl EntityStore {
     }
 
     /// Löscht einen Composite-Index (über ein exaktes Feld-Set).
-    pub fn drop_composite_index(
-        &mut self,
-        collection_id: u32,
-        field_ids: &[u32],
-    ) -> Result<()> {
-        if let Some(def) = self
-            .schema
-            .find_index_by_fields(collection_id, field_ids)
-        {
+    pub fn drop_composite_index(&mut self, collection_id: u32, field_ids: &[u32]) -> Result<()> {
+        if let Some(def) = self.schema.find_index_by_fields(collection_id, field_ids) {
             index::clear_composite(&mut self.db, collection_id, def.id)?;
             self.schema.drop_index(def.id);
             self.schema.save(&self.schema_path)?;
@@ -1636,7 +1628,9 @@ impl<'a> CollectionHandle<'a> {
             .schema
             .find_index_by_fields(self.collection_id, &field_ids)
             .ok_or_else(|| Error::InvalidArgument("no composite index on fields".into()))?;
-        let mut m = DirectMutator { db: &mut self.store.db };
+        let mut m = DirectMutator {
+            db: &mut self.store.db,
+        };
         index::find_composite_m(
             &mut m,
             &self.store.schema,

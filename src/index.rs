@@ -341,9 +341,8 @@ pub(crate) fn find_composite_m<M: Mutator>(
 /// Löscht alle Composite-Index-Keys eines (collection, index).
 pub fn clear_composite(db: &mut Database, collection_id: u32, index_id: u32) -> Result<()> {
     let start = keycodec::composite_prefix(collection_id, index_id);
-    let end = keycodec::successor(&start).ok_or_else(|| {
-        Error::InvalidFormat("composite prefix has no successor".into())
-    })?;
+    let end = keycodec::successor(&start)
+        .ok_or_else(|| Error::InvalidFormat("composite prefix has no successor".into()))?;
     let rows = db.scan(Some(&start), Some(&end))?;
     for (key, _) in rows {
         db.delete(&key)?;
@@ -363,13 +362,14 @@ pub fn rebuild_composite(
 ) -> Result<()> {
     clear_composite(db, collection_id, index_id)?;
     let pstart = keycodec::collection_prefix(collection_id);
-    let pend = keycodec::successor(&pstart).ok_or_else(|| {
-        Error::InvalidFormat("collection prefix has no successor".into())
-    })?;
+    let pend = keycodec::successor(&pstart)
+        .ok_or_else(|| Error::InvalidFormat("collection prefix has no successor".into()))?;
     let rows = db.scan(Some(&pstart), Some(&pend))?;
     // Feld-Keys pro Entity sammeln.
-    let mut entity_fields: std::collections::HashMap<Vec<u8>, std::collections::HashMap<u32, Value>> =
-        std::collections::HashMap::new();
+    let mut entity_fields: std::collections::HashMap<
+        Vec<u8>,
+        std::collections::HashMap<u32, Value>,
+    > = std::collections::HashMap::new();
     for (key, value_opt) in rows {
         let Some((_, ee, ef)) = keycodec::decode_entity_key(&key) else {
             continue;

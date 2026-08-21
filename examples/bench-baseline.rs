@@ -73,7 +73,11 @@ fn bench_flush(n: usize) {
     let med = flush_us[flush_us.len() / 2];
     println!(
         "[FLUSH]    k={:<6} rounds={} : median {:>9.1} us/flush  segments={} compaction={}",
-        k, rounds, med as f64, seg_after, if compacted { "yes" } else { "no" }
+        k,
+        rounds,
+        med as f64,
+        seg_after,
+        if compacted { "yes" } else { "no" }
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -102,11 +106,13 @@ fn bench_compaction_isolated() {
         for pair in 0..pairs {
             let base = pair * 2 * recs_per_seg;
             for i in 0..recs_per_seg {
-                db.put(format!("k{:08}", base + i).as_bytes(), b"v").unwrap();
+                db.put(format!("k{:08}", base + i).as_bytes(), b"v")
+                    .unwrap();
             }
             db.flush().unwrap(); // L0=[T1], noch kein Compact (1 < threshold)
             for i in 0..recs_per_seg {
-                db.put(format!("k{:08}", base + recs_per_seg + i).as_bytes(), b"v").unwrap();
+                db.put(format!("k{:08}", base + recs_per_seg + i).as_bytes(), b"v")
+                    .unwrap();
             }
             db.flush().unwrap(); // L0=[T1,T2] → Compact: 2 neue Segmente
         }
@@ -180,11 +186,13 @@ fn bench_compaction_forensic(segs: usize, recs_per_seg: u32) {
     for pair in 0..pairs {
         let base = pair * 2 * recs;
         for i in 0..recs {
-            db.put(format!("k{:08}", base + i).as_bytes(), b"v").unwrap();
+            db.put(format!("k{:08}", base + i).as_bytes(), b"v")
+                .unwrap();
         }
         db.flush().unwrap();
         for i in 0..recs {
-            db.put(format!("k{:08}", base + recs + i).as_bytes(), b"v").unwrap();
+            db.put(format!("k{:08}", base + recs + i).as_bytes(), b"v")
+                .unwrap();
         }
         db.flush().unwrap(); // L0=[T1,T2] → Compact: 2 neue Segmente
     }
@@ -282,10 +290,7 @@ fn bench_fsync() {
         let per_file = (med_yes - med_no) as f64 / n as f64;
         println!(
             "[FSYNC]     n={:<3} : write+flush {:>8.1} us | write+flush+sync_all {:>9.1} us  ({} us/file sync-Delta)",
-            n,
-            med_no as f64,
-            med_yes as f64,
-            per_file
+            n, med_no as f64, med_yes as f64, per_file
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -342,7 +347,7 @@ fn bench_entity_gate() {
             store.flush().unwrap();
             store.close().unwrap();
             // Nach Close: Struktur über eine frische Database-View erheben.
-let db = Database::open_with(&dir, Options::default()).unwrap();
+            let db = Database::open_with(&dir, Options::default()).unwrap();
             let t = db.table_count();
             let s = db.segment_count();
             let l0 = db.level_tables(0);
@@ -417,7 +422,9 @@ fn main() {
     println!();
 
     println!("--- compaction forensic: segments x records/segment ---");
-    println!("(base_flush = 1 Table schreiben+Manifest; merge/read = voller scan; Rest = Output+Manifest+Cleanup)");
+    println!(
+        "(base_flush = 1 Table schreiben+Manifest; merge/read = voller scan; Rest = Output+Manifest+Cleanup)"
+    );
     for segs in [5usize, 10, 25, 50] {
         for recs in [8u32, 80, 800] {
             bench_compaction_forensic(segs, recs);

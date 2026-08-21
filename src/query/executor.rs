@@ -459,10 +459,7 @@ fn sort_rows(rows: &mut [(String, Entity)], field: &str, dir: SortDir) {
 /// vorhandenes `Value::Null` wird dagegen eingeschlossen. Dies ist bewusst
 /// KEINE Decode-/Storage-Optimierung — die Entities werden vollständig
 /// materialisiert und danach auf die angeforderten Felder reduziert.
-pub fn project_rows(
-    rows: Vec<(String, Entity)>,
-    fields: &[String],
-) -> Vec<(String, Entity)> {
+pub fn project_rows(rows: Vec<(String, Entity)>, fields: &[String]) -> Vec<(String, Entity)> {
     rows.into_iter()
         .map(|(id, e)| {
             let mut pe = Entity::new();

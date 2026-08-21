@@ -255,6 +255,9 @@ fn no_manifest_refs_to_missing_files_after_compaction() {
     let reopened = Database::open(dir.path()).unwrap();
     for id in reopened.table_ids() {
         let path = dir.path().join(format!("{:06}.sst", id));
-        assert!(path.exists(), "manifest verweist auf fehlende Datei {path:?}");
+        assert!(
+            path.exists(),
+            "manifest verweist auf fehlende Datei {path:?}"
+        );
     }
 }

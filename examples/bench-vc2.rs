@@ -9,9 +9,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
-use my_lsm_db::Options;
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();

@@ -14,11 +14,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use my_lsm_db::Database;
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
 use my_lsm_db::index::FindOp;
-use my_lsm_db::Database;
-use my_lsm_db::Options;
 
 fn tmp_dir() -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -192,7 +192,11 @@ fn profile_read(dir: &PathBuf, n: usize) {
             "    {:<12} {:>10} us | {:>6.2}%",
             name,
             us,
-            if sum > 0 { *us as f64 / sum as f64 * 100.0 } else { 0.0 }
+            if sum > 0 {
+                *us as f64 / sum as f64 * 100.0
+            } else {
+                0.0
+            }
         );
     }
     println!("  Read-Gesamt (Summe Blöcke): {} us", sum);
@@ -253,7 +257,9 @@ fn profile_local_global(dir: &PathBuf, n: usize) {
     });
     let (_, global_us) = timed(|| {
         for _ in 0..10_000 {
-            let _ = col.get(&format!("e{:08}", rand_idx(100, n) as u64)).unwrap();
+            let _ = col
+                .get(&format!("e{:08}", rand_idx(100, n) as u64))
+                .unwrap();
         }
     });
     println!(

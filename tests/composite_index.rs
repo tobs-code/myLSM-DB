@@ -70,89 +70,118 @@ fn composite_oracle() -> Result<()> {
     let mut store = EntityStore::open(dir.path()).unwrap();
 
     // Datenmodell: last, first, country, age, name, team, score, kind, val.
-    insert(&mut store, "u1", &[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("John".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(30)),
-        ("name", Value::String("Alice".into())),
-        ("team", Value::String("T1".into())),
-        ("score", Value::Int(10)),
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ]);
-    insert(&mut store, "u2", &[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("John".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(40)),
-        ("name", Value::String("Bob".into())),
-        ("team", Value::String("T1".into())),
-        ("score", Value::Null), // present NULL
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ]);
-    insert(&mut store, "u3", &[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("Jane".into())),
-        ("country", Value::String("US".into())),
-        ("age", Value::Int(25)),
-        ("name", Value::String("Carol".into())),
-        ("team", Value::String("T2".into())),
-        ("score", Value::Int(20)),
-        ("kind", Value::String("b".into())),
-        ("val", Value::String("x".into())),
-    ]);
-    insert(&mut store, "u4", &[
-        ("last", Value::String("Doe".into())),
-        ("first", Value::String("John".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(35)),
-        ("name", Value::String("Alice".into())),
-        ("team", Value::String("T1".into())),
-        // score ABSENT
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ]);
-    insert(&mut store, "u5", &[
-        ("last", Value::String("Doe".into())),
-        ("first", Value::String("Jane".into())),
-        ("country", Value::String("US".into())),
-        ("age", Value::Int(50)),
-        ("name", Value::String("Bob".into())),
-        ("team", Value::String("T2".into())),
-        ("score", Value::Int(10)),
-        ("kind", Value::String("b".into())),
-        ("val", Value::String("y".into())),
-    ]);
-    insert(&mut store, "u6", &[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("Jane".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(30)),
-        ("name", Value::String("Carol".into())),
-        ("team", Value::String("T1".into())),
-        ("score", Value::Null),
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ]);
-    insert(&mut store, "u7", &[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("Jane".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(30)),
-        ("name", Value::String("Alice".into())),
-        ("team", Value::String("T2".into())),
-        ("score", Value::Int(10)),
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ]);
+    insert(
+        &mut store,
+        "u1",
+        &[
+            ("last", Value::String("Smith".into())),
+            ("first", Value::String("John".into())),
+            ("country", Value::String("DE".into())),
+            ("age", Value::Int(30)),
+            ("name", Value::String("Alice".into())),
+            ("team", Value::String("T1".into())),
+            ("score", Value::Int(10)),
+            ("kind", Value::String("a".into())),
+            ("val", Value::Int(5)),
+        ],
+    );
+    insert(
+        &mut store,
+        "u2",
+        &[
+            ("last", Value::String("Smith".into())),
+            ("first", Value::String("John".into())),
+            ("country", Value::String("DE".into())),
+            ("age", Value::Int(40)),
+            ("name", Value::String("Bob".into())),
+            ("team", Value::String("T1".into())),
+            ("score", Value::Null), // present NULL
+            ("kind", Value::String("a".into())),
+            ("val", Value::Int(5)),
+        ],
+    );
+    insert(
+        &mut store,
+        "u3",
+        &[
+            ("last", Value::String("Smith".into())),
+            ("first", Value::String("Jane".into())),
+            ("country", Value::String("US".into())),
+            ("age", Value::Int(25)),
+            ("name", Value::String("Carol".into())),
+            ("team", Value::String("T2".into())),
+            ("score", Value::Int(20)),
+            ("kind", Value::String("b".into())),
+            ("val", Value::String("x".into())),
+        ],
+    );
+    insert(
+        &mut store,
+        "u4",
+        &[
+            ("last", Value::String("Doe".into())),
+            ("first", Value::String("John".into())),
+            ("country", Value::String("DE".into())),
+            ("age", Value::Int(35)),
+            ("name", Value::String("Alice".into())),
+            ("team", Value::String("T1".into())),
+            // score ABSENT
+            ("kind", Value::String("a".into())),
+            ("val", Value::Int(5)),
+        ],
+    );
+    insert(
+        &mut store,
+        "u5",
+        &[
+            ("last", Value::String("Doe".into())),
+            ("first", Value::String("Jane".into())),
+            ("country", Value::String("US".into())),
+            ("age", Value::Int(50)),
+            ("name", Value::String("Bob".into())),
+            ("team", Value::String("T2".into())),
+            ("score", Value::Int(10)),
+            ("kind", Value::String("b".into())),
+            ("val", Value::String("y".into())),
+        ],
+    );
+    insert(
+        &mut store,
+        "u6",
+        &[
+            ("last", Value::String("Smith".into())),
+            ("first", Value::String("Jane".into())),
+            ("country", Value::String("DE".into())),
+            ("age", Value::Int(30)),
+            ("name", Value::String("Carol".into())),
+            ("team", Value::String("T1".into())),
+            ("score", Value::Null),
+            ("kind", Value::String("a".into())),
+            ("val", Value::Int(5)),
+        ],
+    );
+    insert(
+        &mut store,
+        "u7",
+        &[
+            ("last", Value::String("Smith".into())),
+            ("first", Value::String("Jane".into())),
+            ("country", Value::String("DE".into())),
+            ("age", Value::Int(30)),
+            ("name", Value::String("Alice".into())),
+            ("team", Value::String("T2".into())),
+            ("score", Value::Int(10)),
+            ("kind", Value::String("a".into())),
+            ("val", Value::Int(5)),
+        ],
+    );
 
     // Indizes anlegen (rebuild über bestehende Daten).
     {
         let mut col = store.collection("users").unwrap();
         col.create_composite_index(&["last", "first"]).unwrap();
-        col.create_composite_index(&["country", "age", "name"]).unwrap();
+        col.create_composite_index(&["country", "age", "name"])
+            .unwrap();
         col.create_composite_index(&["team", "score"]).unwrap();
         col.create_composite_index(&["kind", "val"]).unwrap();
         // Parallele Single-Field-Indizes.
@@ -163,119 +192,196 @@ fn composite_oracle() -> Result<()> {
     // --- Oracle: planner ≡ naive für diverse Prädikate ---
     assert_plan_eq_naive(&mut store, None);
     assert_plan_eq_naive(&mut store, Some(eq("last", Value::String("Smith".into()))));
-    assert_plan_eq_naive(&mut store, Some(
-        eq("last", Value::String("Smith".into()))
-            .and(eq("first", Value::String("John".into()))),
-    ));
-    assert_plan_eq_naive(&mut store, Some(
-        eq("country", Value::String("DE".into()))
-            .and(gt("age", Value::Int(30))),
-    ));
-    assert_plan_eq_naive(&mut store, Some(
-        eq("country", Value::String("DE".into()))
-            .and(eq("age", Value::Int(30)))
-            .and(eq("name", Value::String("Alice".into()))),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("last", Value::String("Smith".into()))
+                .and(eq("first", Value::String("John".into()))),
+        ),
+    );
+    assert_plan_eq_naive(
+        &mut store,
+        Some(eq("country", Value::String("DE".into())).and(gt("age", Value::Int(30)))),
+    );
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("country", Value::String("DE".into()))
+                .and(eq("age", Value::Int(30)))
+                .and(eq("name", Value::String("Alice".into()))),
+        ),
+    );
     // Range-Only auf letzter Composite-Komponente (country eq, age range).
-    assert_plan_eq_naive(&mut store, Some(
-        eq("country", Value::String("DE".into()))
-            .and(ge("age", Value::Int(30)))
-            .and(le("age", Value::Int(40))),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("country", Value::String("DE".into()))
+                .and(ge("age", Value::Int(30)))
+                .and(le("age", Value::Int(40))),
+        ),
+    );
     // NULL vs absent: team=T1 AND score=NULL.
-    assert_plan_eq_naive(&mut store, Some(
-        eq("team", Value::String("T1".into()))
-            .and(eq("score", Value::Null)),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(eq("team", Value::String("T1".into())).and(eq("score", Value::Null))),
+    );
     // Mixed types in val-Komponente.
-    assert_plan_eq_naive(&mut store, Some(
-        eq("kind", Value::String("a".into()))
-            .and(eq("val", Value::Int(5))),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(eq("kind", Value::String("a".into())).and(eq("val", Value::Int(5)))),
+    );
     // Prädikat, das der Composite-Präfixregel nicht genügt (erste Komponente
     // ungebunden) → fällt auf Single-Field-Index / FullScan zurück.
     assert_plan_eq_naive(&mut store, Some(eq("first", Value::String("John".into()))));
     assert_plan_eq_naive(&mut store, Some(eq("age", Value::Int(30))));
     // Ungleichheit (Residual-Filter über Index-Kandidaten).
-    assert_plan_eq_naive(&mut store, Some(
-        eq("last", Value::String("Smith".into()))
-            .and(ne("first", Value::String("John".into()))),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("last", Value::String("Smith".into()))
+                .and(ne("first", Value::String("John".into()))),
+        ),
+    );
 
     // --- Explizite Erwartungsmengen (direktes find_composite) ---
     // 2-Feld-Equality liefert Duplikat-Tupel (u1, u2).
-    let ids = store.collection("users").unwrap().find_composite(&["last", "first"], &[
-        (0, Bound::Inclusive(Value::String("Smith".into())), Bound::Inclusive(Value::String("Smith".into()))),
-        (1, Bound::Inclusive(Value::String("John".into())), Bound::Inclusive(Value::String("John".into()))),
-    ]).unwrap();
+    let ids = store
+        .collection("users")
+        .unwrap()
+        .find_composite(
+            &["last", "first"],
+            &[
+                (
+                    0,
+                    Bound::Inclusive(Value::String("Smith".into())),
+                    Bound::Inclusive(Value::String("Smith".into())),
+                ),
+                (
+                    1,
+                    Bound::Inclusive(Value::String("John".into())),
+                    Bound::Inclusive(Value::String("John".into())),
+                ),
+            ],
+        )
+        .unwrap();
     let mut ids = ids;
     ids.sort();
     assert_eq!(ids, vec!["u1".to_string(), "u2".to_string()]);
 
     // NULL (present) wird gefunden, absent nicht: team=T1 AND score=NULL.
-    let ids = store.collection("users").unwrap().find_composite(&["team", "score"], &[
-        (0, Bound::Inclusive(Value::String("T1".into())), Bound::Inclusive(Value::String("T1".into()))),
-        (1, Bound::Inclusive(Value::Null), Bound::Inclusive(Value::Null)),
-    ]).unwrap();
+    let ids = store
+        .collection("users")
+        .unwrap()
+        .find_composite(
+            &["team", "score"],
+            &[
+                (
+                    0,
+                    Bound::Inclusive(Value::String("T1".into())),
+                    Bound::Inclusive(Value::String("T1".into())),
+                ),
+                (
+                    1,
+                    Bound::Inclusive(Value::Null),
+                    Bound::Inclusive(Value::Null),
+                ),
+            ],
+        )
+        .unwrap();
     let mut ids = ids;
     ids.sort();
     assert_eq!(ids, vec!["u2".to_string(), "u6".to_string()]);
 
     // --- Mutation: Update eines Index-Feldes ---
     // u1: last Smith→Changed. Danach darf (Smith,John) u1 nicht mehr liefern.
-    store.collection("users").unwrap().put("u1", &e(&[
-        ("last", Value::String("Changed".into())),
-        ("first", Value::String("John".into())),
-        ("country", Value::String("DE".into())),
-        ("age", Value::Int(30)),
-        ("name", Value::String("Alice".into())),
-        ("team", Value::String("T1".into())),
-        ("score", Value::Int(10)),
-        ("kind", Value::String("a".into())),
-        ("val", Value::Int(5)),
-    ])).unwrap();
-    assert_plan_eq_naive(&mut store, Some(
-        eq("last", Value::String("Smith".into()))
-            .and(eq("first", Value::String("John".into()))),
-    ));
-    let ids = store.collection("users").unwrap().find_composite(&["last", "first"], &[
-        (0, Bound::Inclusive(Value::String("Changed".into())), Bound::Inclusive(Value::String("Changed".into()))),
-        (1, Bound::Inclusive(Value::String("John".into())), Bound::Inclusive(Value::String("John".into()))),
-    ]).unwrap();
+    store
+        .collection("users")
+        .unwrap()
+        .put(
+            "u1",
+            &e(&[
+                ("last", Value::String("Changed".into())),
+                ("first", Value::String("John".into())),
+                ("country", Value::String("DE".into())),
+                ("age", Value::Int(30)),
+                ("name", Value::String("Alice".into())),
+                ("team", Value::String("T1".into())),
+                ("score", Value::Int(10)),
+                ("kind", Value::String("a".into())),
+                ("val", Value::Int(5)),
+            ]),
+        )
+        .unwrap();
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("last", Value::String("Smith".into()))
+                .and(eq("first", Value::String("John".into()))),
+        ),
+    );
+    let ids = store
+        .collection("users")
+        .unwrap()
+        .find_composite(
+            &["last", "first"],
+            &[
+                (
+                    0,
+                    Bound::Inclusive(Value::String("Changed".into())),
+                    Bound::Inclusive(Value::String("Changed".into())),
+                ),
+                (
+                    1,
+                    Bound::Inclusive(Value::String("John".into())),
+                    Bound::Inclusive(Value::String("John".into())),
+                ),
+            ],
+        )
+        .unwrap();
     let mut ids = ids;
     ids.sort();
     assert_eq!(ids, vec!["u1".to_string()]);
 
     // --- Mutation: Delete / Reinsert ---
     store.collection("users").unwrap().delete("u3").unwrap();
-    assert_plan_eq_naive(&mut store, Some(
-        eq("last", Value::String("Smith".into()))
-            .and(eq("first", Value::String("Jane".into()))),
-    ));
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("last", Value::String("Smith".into()))
+                .and(eq("first", Value::String("Jane".into()))),
+        ),
+    );
     // Wieder einfügen.
-    store.collection("users").unwrap().put("u3", &e(&[
-        ("last", Value::String("Smith".into())),
-        ("first", Value::String("Jane".into())),
-        ("country", Value::String("US".into())),
-        ("age", Value::Int(25)),
-        ("name", Value::String("Carol".into())),
-        ("team", Value::String("T2".into())),
-        ("score", Value::Int(20)),
-        ("kind", Value::String("b".into())),
-        ("val", Value::String("x".into())),
-    ])).unwrap();
-    assert_plan_eq_naive(&mut store, Some(
-        eq("last", Value::String("Smith".into()))
-            .and(eq("first", Value::String("Jane".into()))),
-    ));
+    store
+        .collection("users")
+        .unwrap()
+        .put(
+            "u3",
+            &e(&[
+                ("last", Value::String("Smith".into())),
+                ("first", Value::String("Jane".into())),
+                ("country", Value::String("US".into())),
+                ("age", Value::Int(25)),
+                ("name", Value::String("Carol".into())),
+                ("team", Value::String("T2".into())),
+                ("score", Value::Int(20)),
+                ("kind", Value::String("b".into())),
+                ("val", Value::String("x".into())),
+            ]),
+        )
+        .unwrap();
+    assert_plan_eq_naive(
+        &mut store,
+        Some(
+            eq("last", Value::String("Smith".into()))
+                .and(eq("first", Value::String("Jane".into()))),
+        ),
+    );
 
     // --- ORDER BY über Composite-Komponente (IndexOrderScan) bleibt korrekt ---
     let mut b = store.query("users").unwrap();
     b = b
-        .filter(
-            eq("country", Value::String("DE".into()))
-                .and(gt("age", Value::Int(0))),
-        )
+        .filter(eq("country", Value::String("DE".into())).and(gt("age", Value::Int(0))))
         .sort("age", SortDir::Asc)
         .limit(100);
     let rows = store.execute_query(b).unwrap();
@@ -310,11 +416,18 @@ fn composite_survives_reopen() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut store = EntityStore::open(dir.path()).unwrap();
-        store.collection("users").unwrap().put("u1", &e(&[
-            ("last", Value::String("Smith".into())),
-            ("first", Value::String("John".into())),
-            ("age", Value::Int(30)),
-        ])).unwrap();
+        store
+            .collection("users")
+            .unwrap()
+            .put(
+                "u1",
+                &e(&[
+                    ("last", Value::String("Smith".into())),
+                    ("first", Value::String("John".into())),
+                    ("age", Value::Int(30)),
+                ]),
+            )
+            .unwrap();
         store
             .collection("users")
             .unwrap()
@@ -323,10 +436,25 @@ fn composite_survives_reopen() -> Result<()> {
     }
     // Reopen: Index-Definition muss geladen werden, Keys bleiben lesbar.
     let mut store = EntityStore::open(dir.path()).unwrap();
-    let ids = store.collection("users").unwrap().find_composite(&["last", "first"], &[
-        (0, Bound::Inclusive(Value::String("Smith".into())), Bound::Inclusive(Value::String("Smith".into()))),
-        (1, Bound::Inclusive(Value::String("John".into())), Bound::Inclusive(Value::String("John".into()))),
-    ]).unwrap();
+    let ids = store
+        .collection("users")
+        .unwrap()
+        .find_composite(
+            &["last", "first"],
+            &[
+                (
+                    0,
+                    Bound::Inclusive(Value::String("Smith".into())),
+                    Bound::Inclusive(Value::String("Smith".into())),
+                ),
+                (
+                    1,
+                    Bound::Inclusive(Value::String("John".into())),
+                    Bound::Inclusive(Value::String("John".into())),
+                ),
+            ],
+        )
+        .unwrap();
     assert_eq!(ids, vec!["u1".to_string()]);
     Ok(())
 }
@@ -337,15 +465,27 @@ fn composite_survives_reopen() -> Result<()> {
 fn legacy_single_field_still_works() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let mut store = EntityStore::open(dir.path()).unwrap();
-    store.collection("users").unwrap().put(
-        "u1",
-        &e(&[("age", Value::Int(30)), ("name", Value::String("A".into()))]),
-    ).unwrap();
-    store.collection("users").unwrap().put(
-        "u2",
-        &e(&[("age", Value::Int(31)), ("name", Value::String("B".into()))]),
-    ).unwrap();
-    store.collection("users").unwrap().create_index("age").unwrap();
+    store
+        .collection("users")
+        .unwrap()
+        .put(
+            "u1",
+            &e(&[("age", Value::Int(30)), ("name", Value::String("A".into()))]),
+        )
+        .unwrap();
+    store
+        .collection("users")
+        .unwrap()
+        .put(
+            "u2",
+            &e(&[("age", Value::Int(31)), ("name", Value::String("B".into()))]),
+        )
+        .unwrap();
+    store
+        .collection("users")
+        .unwrap()
+        .create_index("age")
+        .unwrap();
     let ids = store
         .collection("users")
         .unwrap()

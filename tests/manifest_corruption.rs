@@ -4,9 +4,9 @@
 
 use std::path::Path;
 
+use my_lsm_db::Database;
 use my_lsm_db::error::Error;
 use my_lsm_db::manifest::Manifest;
-use my_lsm_db::Database;
 
 fn manifest_path(dir: &Path) -> std::path::PathBuf {
     dir.join("MANIFEST")

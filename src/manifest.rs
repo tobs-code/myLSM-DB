@@ -44,9 +44,9 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for i in (0..bytes.len()).step_by(2) {
-        let hi = (bytes[i] as char).to_digit(16).ok_or_else(|| {
-            Error::InvalidFormat(format!("segment hex range bad char at {i}"))
-        })?;
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| Error::InvalidFormat(format!("segment hex range bad char at {i}")))?;
         let lo = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
             Error::InvalidFormat(format!("segment hex range bad char at {}", i + 1))
         })?;
@@ -89,9 +89,7 @@ impl Manifest {
         let mut seen: Vec<u64> = self.all_ids();
         seen.sort_unstable();
         if seen.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Error::InvalidFormat(
-                "manifest duplicate table id".into(),
-            ));
+            return Err(Error::InvalidFormat("manifest duplicate table id".into()));
         }
         Ok(())
     }
@@ -247,11 +245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("MANIFEST");
         // Disjunkt: [a..m] = 61/6d, [n..z] = 6e/7a → ok
-        std::fs::write(
-            &path,
-            "N 10\nL 0 1\nS 1 3 61 6d 7\nS 1 5 6e 7a 9\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "N 10\nL 0 1\nS 1 3 61 6d 7\nS 1 5 6e 7a 9\n").unwrap();
         assert!(Manifest::load(&path).is_ok());
         // Überlappend: [a..z] = 61/7a und [m..z] = 6d/7a → hart abgelehnt
         std::fs::write(&path, "N 10\nS 1 3 61 7a 5\nS 1 5 6d 7a 5\n").unwrap();

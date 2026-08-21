@@ -8,11 +8,11 @@
 
 use tempfile::tempdir;
 
+use my_lsm_db::Options;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore, Expected, Patch};
 use my_lsm_db::error::{ConflictReason, Error};
 use my_lsm_db::index::FindOp;
-use my_lsm_db::Options;
 
 fn opts() -> Options {
     Options::default()
@@ -34,7 +34,15 @@ fn cas_hit_exactly_one_mutation() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into())), ("age", Value::Int(30)), ("city", Value::String("berlin".into()))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[
+            ("name", Value::String("alice".into())),
+            ("age", Value::Int(30)),
+            ("city", Value::String("berlin".into())),
+        ]),
+    )
+    .unwrap();
     drop(coll);
 
     let before = {
@@ -42,7 +50,12 @@ fn cas_hit_exactly_one_mutation() {
         c.get("u1").unwrap().unwrap()
     };
     let res = store
-        .cas_update("users", "u1", &Expected::Entity(before.clone()), &[Patch::Set("age".into(), Value::Int(31))])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Entity(before.clone()),
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
         .unwrap();
     assert_eq!(res.field("age"), Some(&Value::Int(31)));
     assert_eq!(res.field("name"), Some(&Value::String("alice".into())));
@@ -65,15 +78,36 @@ fn cas_miss_unchanged() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into())), ("age", Value::Int(30))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[
+            ("name", Value::String("alice".into())),
+            ("age", Value::Int(30)),
+        ]),
+    )
+    .unwrap();
     drop(coll);
 
-    let mut wrong = entity(&[("name", Value::String("alice".into())), ("age", Value::Int(30))]);
+    let mut wrong = entity(&[
+        ("name", Value::String("alice".into())),
+        ("age", Value::Int(30)),
+    ]);
     wrong.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(99);
     let err = store
-        .cas_update("users", "u1", &Expected::Entity(wrong), &[Patch::Set("age".into(), Value::Int(31))])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Entity(wrong),
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
         .unwrap_err();
-    assert!(matches!(err, Error::Conflict { reason: ConflictReason::ExpectedValueMismatch, .. }));
+    assert!(matches!(
+        err,
+        Error::Conflict {
+            reason: ConflictReason::ExpectedValueMismatch,
+            ..
+        }
+    ));
 
     let mut c = store.collection("users").unwrap();
     let got = c.get("u1").unwrap().unwrap();
@@ -89,16 +123,33 @@ fn absent_only_when_missing() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into()))])).unwrap();
+    coll.put("u1", &entity(&[("name", Value::String("alice".into()))]))
+        .unwrap();
     drop(coll);
 
     let err = store
-        .cas_update("users", "u1", &Expected::Absent, &[Patch::Set("x".into(), Value::Int(1))])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Absent,
+            &[Patch::Set("x".into(), Value::Int(1))],
+        )
         .unwrap_err();
-    assert!(matches!(err, Error::Conflict { reason: ConflictReason::ExpectedAbsentButExists, .. }));
+    assert!(matches!(
+        err,
+        Error::Conflict {
+            reason: ConflictReason::ExpectedAbsentButExists,
+            ..
+        }
+    ));
 
     let res = store
-        .cas_update("users", "u2", &Expected::Absent, &[Patch::Set("name".into(), Value::String("bob".into()))])
+        .cas_update(
+            "users",
+            "u2",
+            &Expected::Absent,
+            &[Patch::Set("name".into(), Value::String("bob".into()))],
+        )
         .unwrap();
     assert_eq!(res.field("name"), Some(&Value::String("bob".into())));
 
@@ -115,12 +166,18 @@ fn null_distinct_from_absent() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into()))])).unwrap();
+    coll.put("u1", &entity(&[("name", Value::String("alice".into()))]))
+        .unwrap();
     drop(coll);
 
     // Set auf Null → present, aber null.
     store
-        .cas_update("users", "u1", &Expected::Any, &[Patch::Set("nick".into(), Value::Null)])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Set("nick".into(), Value::Null)],
+        )
         .unwrap();
     let mut c = store.collection("users").unwrap();
     let g = c.get("u1").unwrap().unwrap();
@@ -128,9 +185,17 @@ fn null_distinct_from_absent() {
     drop(c);
 
     // Remove → danach absent (nicht Null). Erwartung muss den Null-Zustand matchen.
-    let cur = entity(&[("name", Value::String("alice".into())), ("nick", Value::Null)]);
+    let cur = entity(&[
+        ("name", Value::String("alice".into())),
+        ("nick", Value::Null),
+    ]);
     store
-        .cas_update("users", "u1", &Expected::Entity(cur), &[Patch::Remove("nick".into())])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Entity(cur),
+            &[Patch::Remove("nick".into())],
+        )
         .unwrap();
     let mut c = store.collection("users").unwrap();
     let g2 = c.get("u1").unwrap().unwrap();
@@ -157,26 +222,71 @@ fn increment_only_numeric() {
     .unwrap();
     drop(coll);
 
-    let r = store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("age".into(), Value::Int(5))]).unwrap();
+    let r = store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Increment("age".into(), Value::Int(5))],
+        )
+        .unwrap();
     assert_eq!(r.field("age"), Some(&Value::Int(15)));
 
-    let r2 = store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("score".into(), Value::Float(0.5))]).unwrap();
+    let r2 = store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Increment("score".into(), Value::Float(0.5))],
+        )
+        .unwrap();
     assert_eq!(r2.field("score"), Some(&Value::Float(2.0)));
 
     // Int-Überlauf wrappt (wrapping_add) — kein Panic.
-    let r3 = store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("age".into(), Value::Int(i64::MAX))]).unwrap();
-    assert_eq!(r3.field("age"), Some(&Value::Int(15i64.wrapping_add(i64::MAX))));
+    let r3 = store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Increment("age".into(), Value::Int(i64::MAX))],
+        )
+        .unwrap();
+    assert_eq!(
+        r3.field("age"),
+        Some(&Value::Int(15i64.wrapping_add(i64::MAX)))
+    );
 
     assert!(matches!(
-        store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("name".into(), Value::Int(1))]).unwrap_err(),
+        store
+            .cas_update(
+                "users",
+                "u1",
+                &Expected::Any,
+                &[Patch::Increment("name".into(), Value::Int(1))]
+            )
+            .unwrap_err(),
         Error::InvalidArgument(_)
     ));
     assert!(matches!(
-        store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("missing".into(), Value::Int(1))]).unwrap_err(),
+        store
+            .cas_update(
+                "users",
+                "u1",
+                &Expected::Any,
+                &[Patch::Increment("missing".into(), Value::Int(1))]
+            )
+            .unwrap_err(),
         Error::InvalidArgument(_)
     ));
     assert!(matches!(
-        store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("age".into(), Value::Float(1.0))]).unwrap_err(),
+        store
+            .cas_update(
+                "users",
+                "u1",
+                &Expected::Any,
+                &[Patch::Increment("age".into(), Value::Float(1.0))]
+            )
+            .unwrap_err(),
         Error::InvalidArgument(_)
     ));
 }
@@ -189,10 +299,24 @@ fn remove_field_removed() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into())), ("age", Value::Int(30))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[
+            ("name", Value::String("alice".into())),
+            ("age", Value::Int(30)),
+        ]),
+    )
+    .unwrap();
     drop(coll);
 
-    store.cas_update("users", "u1", &Expected::Any, &[Patch::Remove("age".into())]).unwrap();
+    store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Remove("age".into())],
+        )
+        .unwrap();
     let mut c = store.collection("users").unwrap();
     let g = c.get("u1").unwrap().unwrap();
     assert_eq!(g.field("age"), None);
@@ -208,19 +332,43 @@ fn index_field_stays_correct() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("alice".into())), ("age", Value::Int(30))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[
+            ("name", Value::String("alice".into())),
+            ("age", Value::Int(30)),
+        ]),
+    )
+    .unwrap();
     coll.create_index("age").unwrap();
     drop(coll);
 
-    store.cas_update("users", "u1", &Expected::Any, &[Patch::Set("age".into(), Value::Int(31))]).unwrap();
+    store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
+        .unwrap();
     let mut c = store.collection("users").unwrap();
     let old = c.find("age", FindOp::Eq(Value::Int(30))).unwrap();
-    assert!(!old.contains(&"u1".to_string()), "alter Index-Eintrag muss weg sein: {old:?}");
+    assert!(
+        !old.contains(&"u1".to_string()),
+        "alter Index-Eintrag muss weg sein: {old:?}"
+    );
     let new = c.find("age", FindOp::Eq(Value::Int(31))).unwrap();
     assert_eq!(new, vec!["u1".to_string()]);
     drop(c);
 
-    store.cas_update("users", "u1", &Expected::Any, &[Patch::Increment("age".into(), Value::Int(1))]).unwrap();
+    store
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Any,
+            &[Patch::Increment("age".into(), Value::Int(1))],
+        )
+        .unwrap();
     let mut c = store.collection("users").unwrap();
     let inc = c.find("age", FindOp::Eq(Value::Int(32))).unwrap();
     assert_eq!(inc, vec!["u1".to_string()]);
@@ -232,14 +380,27 @@ fn index_field_stays_correct() {
 #[test]
 fn direct_equiv_tx() {
     let ops = vec![
-        (Expected::Any, vec![Patch::Increment("age".into(), Value::Int(4)), Patch::Set("name".into(), Value::String("a2".into()))]),
-        (Expected::Field("name".into(), Value::String("a2".into())), vec![Patch::Remove("name".into())]),
+        (
+            Expected::Any,
+            vec![
+                Patch::Increment("age".into(), Value::Int(4)),
+                Patch::Set("name".into(), Value::String("a2".into())),
+            ],
+        ),
+        (
+            Expected::Field("name".into(), Value::String("a2".into())),
+            vec![Patch::Remove("name".into())],
+        ),
     ];
 
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("a".into())), ("age", Value::Int(1))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[("name", Value::String("a".into())), ("age", Value::Int(1))]),
+    )
+    .unwrap();
     drop(coll);
     for (exp, patches) in &ops {
         store.cas_update("users", "u1", exp, patches).unwrap();
@@ -252,7 +413,11 @@ fn direct_equiv_tx() {
     let dir2 = tempdir().unwrap();
     let mut store2 = EntityStore::open_with(dir2.path(), opts()).unwrap();
     let mut coll = store2.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("a".into())), ("age", Value::Int(1))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[("name", Value::String("a".into())), ("age", Value::Int(1))]),
+    )
+    .unwrap();
     drop(coll);
     let mut tx = store2.transaction().unwrap();
     for (exp, patches) in &ops {
@@ -265,7 +430,10 @@ fn direct_equiv_tx() {
         c.get("u1").unwrap().unwrap()
     };
 
-    assert_eq!(direct, txr, "Direct- und Transaction-CAS müssen identische Entität liefern");
+    assert_eq!(
+        direct, txr,
+        "Direct- und Transaction-CAS müssen identische Entität liefern"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -276,16 +444,36 @@ fn expected_field_mismatch() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("a".into())), ("age", Value::Int(30))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[("name", Value::String("a".into())), ("age", Value::Int(30))]),
+    )
+    .unwrap();
     drop(coll);
 
     let err = store
-        .cas_update("users", "u1", &Expected::Field("age".into(), Value::Int(31)), &[Patch::Set("age".into(), Value::Int(31))])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Field("age".into(), Value::Int(31)),
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
         .unwrap_err();
-    assert!(matches!(err, Error::Conflict { reason: ConflictReason::ExpectedFieldMismatch, .. }));
+    assert!(matches!(
+        err,
+        Error::Conflict {
+            reason: ConflictReason::ExpectedFieldMismatch,
+            ..
+        }
+    ));
 
     store
-        .cas_update("users", "u1", &Expected::Field("age".into(), Value::Int(30)), &[Patch::Set("age".into(), Value::Int(31))])
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Field("age".into(), Value::Int(30)),
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
         .unwrap();
 }
 
@@ -297,7 +485,8 @@ fn crash_commit_atomic() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("a".into()))])).unwrap();
+    coll.put("u1", &entity(&[("name", Value::String("a".into()))]))
+        .unwrap();
     drop(coll);
 
     let mut tx = store.transaction().unwrap();
@@ -336,15 +525,33 @@ fn cas_conflict_in_tx_no_partial() {
     let dir = tempdir().unwrap();
     let mut store = EntityStore::open_with(dir.path(), opts()).unwrap();
     let mut coll = store.collection("users").unwrap();
-    coll.put("u1", &entity(&[("name", Value::String("a".into())), ("age", Value::Int(30))])).unwrap();
-    coll.put("u2", &entity(&[("name", Value::String("b".into()))])).unwrap();
+    coll.put(
+        "u1",
+        &entity(&[("name", Value::String("a".into())), ("age", Value::Int(30))]),
+    )
+    .unwrap();
+    coll.put("u2", &entity(&[("name", Value::String("b".into()))]))
+        .unwrap();
     drop(coll);
 
     let mut tx = store.transaction().unwrap();
-    tx.cas_update("users", "u2", &Expected::Any, &[Patch::Set("name".into(), Value::String("b2".into()))]).unwrap();
+    tx.cas_update(
+        "users",
+        "u2",
+        &Expected::Any,
+        &[Patch::Set("name".into(), Value::String("b2".into()))],
+    )
+    .unwrap();
     let mut wrong = entity(&[("name", Value::String("a".into())), ("age", Value::Int(30))]);
     wrong.fields.iter_mut().find(|(n, _)| n == "age").unwrap().1 = Value::Int(99);
-    let err = tx.cas_update("users", "u1", &Expected::Entity(wrong), &[Patch::Set("age".into(), Value::Int(31))]).unwrap_err();
+    let err = tx
+        .cas_update(
+            "users",
+            "u1",
+            &Expected::Entity(wrong),
+            &[Patch::Set("age".into(), Value::Int(31))],
+        )
+        .unwrap_err();
     assert!(matches!(err, Error::Conflict { .. }));
     tx.commit().unwrap();
     drop(tx);

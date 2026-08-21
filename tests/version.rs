@@ -7,11 +7,11 @@
 
 use std::fs;
 
+use my_lsm_db::Database;
 use my_lsm_db::codec::Value;
 use my_lsm_db::entity::{Entity, EntityStore};
 use my_lsm_db::error::Error;
 use my_lsm_db::version::FORMAT_VERSION;
-use my_lsm_db::Database;
 
 /// Erzeugt eine vollständig auf Platte liegende Datenbank (MANIFEST, SSTable,
 /// SCHEMA, VERSION) mit einer Entität.

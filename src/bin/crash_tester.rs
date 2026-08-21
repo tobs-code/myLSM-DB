@@ -7,6 +7,19 @@
 //!
 //! Der Loop über viele Runs (mit zufälligen Kill-Punkten) passiert im Test
 //! `tests/crash.rs` via `std::process::Command`.
+// Stil-Lints bewusst erlaubt (siehe Begründung in src/lib.rs); betrifft nur
+// Kosmetik, keine Korrektheit.
+#![allow(
+    clippy::collapsible_if,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::manual_is_multiple_of,
+    clippy::get_first,
+    clippy::ptr_arg,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_sort_by
+)]
+
 use my_lsm_db::{Database, Options};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,14 +150,16 @@ fn seed_compaction(dir: &std::path::Path, n: usize) {
 /// geprüft, dass keine Manifest-Referenz auf eine fehlende Datei zeigt.
 fn verify_compaction(dir: &std::path::Path, n: usize) {
     // Gültige Werte pro Key-Index (deterministisch aus der Seed-Sequenz).
-    let mut valid: std::collections::HashMap<u32, Vec<Vec<u8>>> =
-        std::collections::HashMap::new();
+    let mut valid: std::collections::HashMap<u32, Vec<Vec<u8>>> = std::collections::HashMap::new();
     for i in 0..n {
         if i % 5 == 0 {
             continue; // delete → kein Wert
         }
         let k = (i % 2000) as u32;
-        valid.entry(k).or_default().push(format!("value-{}", i).into_bytes());
+        valid
+            .entry(k)
+            .or_default()
+            .push(format!("value-{}", i).into_bytes());
     }
     for vals in valid.values_mut() {
         vals.sort();

@@ -44,10 +44,7 @@ fn assert_disjoint(db: &Database, dir: &Path) {
     let segs = db.segments();
     for w in segs.windows(2) {
         assert!(w[0].min_key < w[1].min_key, "segments not sorted: {w:?}");
-        assert!(
-            w[0].max_key < w[1].min_key,
-            "segments overlap: {w:?}"
-        );
+        assert!(w[0].max_key < w[1].min_key, "segments overlap: {w:?}");
     }
     for s in segs {
         assert!(s.min_key <= s.max_key, "segment range inverted: {s:?}");
@@ -95,13 +92,17 @@ fn partial_update_preserved_across_segments() {
     let mut db = db(dir.path());
     for round in 0..3 {
         db.put(b"E:1", b"1").unwrap();
-        db.put(b"E:1.name", format!("alice{round}").as_bytes()).unwrap();
+        db.put(b"E:1.name", format!("alice{round}").as_bytes())
+            .unwrap();
         db.put(b"E:1.age", b"30").unwrap();
         db.put(b"E:1.city", b"berlin").unwrap();
         db.flush().unwrap();
         db.put(b"E:1.age", b"31").unwrap();
         db.flush().unwrap(); // compact
-        assert_eq!(db.get(b"E:1.name").unwrap(), Some(format!("alice{round}").into_bytes()));
+        assert_eq!(
+            db.get(b"E:1.name").unwrap(),
+            Some(format!("alice{round}").into_bytes())
+        );
         assert_eq!(db.get(b"E:1.age").unwrap(), Some(b"31".to_vec()));
         assert_eq!(db.get(b"E:1.city").unwrap(), Some(b"berlin".to_vec()));
     }
@@ -249,7 +250,10 @@ fn tombstone_sweep_removes_dead_keys_physically() {
     }
     // Physischer Sweep: kein Segment enthält gelöschte Keys mehr.
     let total_records: u64 = db.segments().iter().map(|s| s.records).sum();
-    assert!(total_records <= 10, "sweep ineffektiv: {total_records} records");
+    assert!(
+        total_records <= 10,
+        "sweep ineffektiv: {total_records} records"
+    );
     assert_disjoint(&db, dir.path());
 }
 
@@ -355,8 +359,14 @@ fn open_fails_on_overlapping_manifest_segments() {
         }
     }
     assert!(s_indices.len() >= 2, "expected at least 2 segments");
-    let first_parts: Vec<String> = lines[s_indices[0]].split_whitespace().map(String::from).collect();
-    let second_parts: Vec<String> = lines[s_indices[1]].split_whitespace().map(String::from).collect();
+    let first_parts: Vec<String> = lines[s_indices[0]]
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let second_parts: Vec<String> = lines[s_indices[1]]
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     lines[s_indices[1]] = format!(
         "S 1 {} {} {} {}",
         second_parts[2], first_parts[3], first_parts[4], second_parts[5]

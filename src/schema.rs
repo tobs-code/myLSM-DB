@@ -191,14 +191,10 @@ impl Schema {
 
     /// Liefert den Index zu einem exakten Feld-Set (Single- oder Composite),
     /// falls vorhanden.
-    pub fn find_index_by_fields(
-        &self,
-        collection_id: u32,
-        field_ids: &[u32],
-    ) -> Option<&IndexDef> {
-        self.indexes.iter().find(|i| {
-            i.collection_id == collection_id && i.field_ids.as_slice() == field_ids
-        })
+    pub fn find_index_by_fields(&self, collection_id: u32, field_ids: &[u32]) -> Option<&IndexDef> {
+        self.indexes
+            .iter()
+            .find(|i| i.collection_id == collection_id && i.field_ids.as_slice() == field_ids)
     }
 
     pub fn index_by_id(&self, id: u32) -> Option<&IndexDef> {

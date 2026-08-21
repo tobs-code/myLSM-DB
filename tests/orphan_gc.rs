@@ -25,16 +25,25 @@ fn open(dir: &Path) -> Database {
 fn build(dir: &Path) -> Database {
     let mut db = open(dir);
     for i in 0u64..10 {
-        db.put(format!("k-{:04}", i).as_bytes(), format!("v-{}", i).as_bytes())
-            .expect("put");
+        db.put(
+            format!("k-{:04}", i).as_bytes(),
+            format!("v-{}", i).as_bytes(),
+        )
+        .expect("put");
     }
     db.flush().expect("flush");
     for i in 10u64..20 {
-        db.put(format!("k-{:04}", i).as_bytes(), format!("v-{}", i).as_bytes())
-            .expect("put");
+        db.put(
+            format!("k-{:04}", i).as_bytes(),
+            format!("v-{}", i).as_bytes(),
+        )
+        .expect("put");
     }
     db.flush().expect("flush"); // L0=2 -> compact -> >=1 Segment
-    assert!(!db.segments().is_empty(), "es muss mindestens ein Segment geben");
+    assert!(
+        !db.segments().is_empty(),
+        "es muss mindestens ein Segment geben"
+    );
     db
 }
 
@@ -48,7 +57,11 @@ fn assert_all_intact(db: &mut Database) {
     for i in 0u64..20 {
         let key = format!("k-{:04}", i);
         let expected = format!("v-{}", i).into_bytes();
-        assert_eq!(db.get(key.as_bytes()).expect("get"), Some(expected), "key {key}");
+        assert_eq!(
+            db.get(key.as_bytes()).expect("get"),
+            Some(expected),
+            "key {key}"
+        );
     }
 }
 
@@ -69,7 +82,10 @@ fn gc_removes_unreferenced_orphan() {
 
     let removed = db.gc().expect("gc");
     assert_eq!(removed, 1, "genau ein Orphan geloescht");
-    assert!(!sst_path(dir.path(), orphan_id).exists(), "Orphan nach gc weg");
+    assert!(
+        !sst_path(dir.path(), orphan_id).exists(),
+        "Orphan nach gc weg"
+    );
     assert_all_intact(&mut db);
 }
 
@@ -90,9 +106,16 @@ fn gc_only_removes_unreferenced_after_commit() {
     assert_eq!(removed, orphans.len(), "alle Orphans geloescht");
 
     for id in referenced.iter() {
-        assert!(sst_path(dir.path(), *id).exists(), "referenziert {id} ueberlebt");
+        assert!(
+            sst_path(dir.path(), *id).exists(),
+            "referenziert {id} ueberlebt"
+        );
     }
-    assert_eq!(db.segments().len(), referenced.len(), "Manifest unveraendert");
+    assert_eq!(
+        db.segments().len(),
+        referenced.len(),
+        "Manifest unveraendert"
+    );
     assert_all_intact(&mut db);
 }
 
@@ -104,7 +127,10 @@ fn gc_never_deletes_referenced() {
     let mut db = build(dir.path());
 
     let ref_id = db.segments()[0].file_id;
-    assert!(sst_path(dir.path(), ref_id).exists(), "referenziert vor gc da");
+    assert!(
+        sst_path(dir.path(), ref_id).exists(),
+        "referenziert vor gc da"
+    );
     // Inhalt absichtlich corrupt schreiben: gc darf referenzierte trotzdem
     // nicht anfassen.
     std::fs::write(sst_path(dir.path(), ref_id), b"corrupt").unwrap();
