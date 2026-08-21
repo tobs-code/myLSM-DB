@@ -1,5 +1,20 @@
 use std::io;
 
+/// Grund für einen optimistischen Concurrency-Konflikt (CAS, v1.2).
+///
+/// Unterscheidet, *welche* Erwartung verletzt wurde, damit ein Caller gezielt
+/// reagieren kann (z. B. read-modify-retry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictReason {
+    /// `Expected::Absent` verlangte eine nicht existierende Entität, die aber
+    /// vorhanden war.
+    ExpectedAbsentButExists,
+    /// `Expected::Entity` verlangte einen exakten Wert, der nicht stimmte.
+    ExpectedValueMismatch,
+    /// `Expected::Field` verlangte einen Feldwert, der nicht stimmte.
+    ExpectedFieldMismatch,
+}
+
 /// Fehler der LSM-Engine.
 #[derive(Debug)]
 pub enum Error {
@@ -26,6 +41,14 @@ pub enum Error {
     InvalidFormat(String),
     /// Argument-/Aufruf-Fehler: falsche Nutzung der API.
     InvalidArgument(String),
+    /// Optimistische Concurrency-Verletzung (CAS, v1.2): der erwartete
+    /// Zustand stimmte nicht mit dem aktuellen überein. Kein Struktur-/IO-
+    /// Fehler, sondern ein erwartbarer Anwendungsfehler mit eigenem Zweig.
+    Conflict {
+        collection_id: u32,
+        entity_id: String,
+        reason: ConflictReason,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -44,6 +67,14 @@ impl std::fmt::Display for Error {
             Error::NotFound => write!(f, "not found"),
             Error::InvalidFormat(s) => write!(f, "invalid format: {s}"),
             Error::InvalidArgument(s) => write!(f, "invalid argument: {s}"),
+            Error::Conflict {
+                collection_id,
+                entity_id,
+                reason,
+            } => write!(
+                f,
+                "cas conflict on collection {collection_id} entity {entity_id}: {reason:?}"
+            ),
         }
     }
 }

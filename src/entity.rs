@@ -20,7 +20,7 @@ use std::ops::Index;
 use std::path::{Path, PathBuf};
 
 use crate::codec::{self, Value};
-use crate::error::{Error, Result};
+use crate::error::{ConflictReason, Error, Result};
 use crate::index::{self, FindOp};
 use crate::keycodec;
 use crate::ordering;
@@ -60,6 +60,194 @@ impl Index<String> for Entity {
     fn index(&self, name: String) -> &Value {
         &self[name.as_str()]
     }
+}
+
+/// Vergleichsbasis für `EntityStore::cas_update` / `Transaction::cas_update`.
+///
+/// Bestimmt, gegen welchen Zustand der aktuelle Entity-Wert geprüft wird,
+/// bevor ein [`Patch`] angewandt wird. Bewusst **wertbasiert** (kein
+/// künstlicher Version-Counter, v1.2): die Architektur liefert kein
+/// Version-Feld, und ein solches würde Schema-Bump + Migration erzwingen.
+#[derive(Debug, Clone)]
+pub enum Expected {
+    /// Unbedingt anwenden (reines Partial-Update ohne Bedingung).
+    Any,
+    /// Nur anwenden, wenn die Entität (noch) nicht existiert.
+    Absent,
+    /// Nur anwenden, wenn der aktuelle Entity-Wert exakt (`entity_eq`) passt.
+    Entity(Entity),
+    /// Nur anwenden, wenn das benannte Feld exakt den Wert hat.
+    Field(String, Value),
+}
+
+/// Eine einzelne feld-wertige Mutation, die bei einem CAS-Hit angewandt wird.
+///
+/// Ändert **nur Feldwerte** existierender Entities; Schema-Umbau (Collections/
+/// Felder anlegen/löschen) liegt ausserhalb von [`Patch`] und läuft über die
+/// bestehende Schema-Registry.
+#[derive(Debug, Clone)]
+pub enum Patch {
+    /// Feld setzen/überschreiben (auch auf `Value::Null` → present, aber null).
+    Set(String, Value),
+    /// Feld entfernen → danach `absent` (unterschiedlich von `Value::Null`).
+    Remove(String),
+    /// Numerisches Feld inkrementieren (Int/Float) um das Delta.
+    Increment(String, Value),
+}
+
+/// Semantischer Entity-Vergleich, unabhängig von der Feld-Reihenfolge im
+/// Speicher (die durch `field_id`-Ordnung bestimmt ist, nicht durch
+/// Einfügereihenfolge).
+fn entity_eq(a: &Entity, b: &Entity) -> bool {
+    if a.fields.len() != b.fields.len() {
+        return false;
+    }
+    for (k, v) in &a.fields {
+        match b.field(k) {
+            Some(bv) if bv == v => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Wendet eine Folge von [`Patch`]-Operationen auf eine Entität an.
+fn apply_patch(entity: &mut Entity, patch: &[Patch]) -> Result<()> {
+    for op in patch {
+        match op {
+            Patch::Set(name, value) => {
+                if let Some(slot) = entity.fields.iter_mut().find(|(n, _)| n == name) {
+                    slot.1 = value.clone();
+                } else {
+                    entity.fields.push((name.clone(), value.clone()));
+                }
+            }
+            Patch::Remove(name) => {
+                entity.fields.retain(|(n, _)| n != name);
+            }
+            Patch::Increment(name, delta) => {
+                let cur = entity.field(name).cloned();
+                match cur {
+                    None => {
+                        return Err(Error::InvalidArgument(format!(
+                            "increment on absent field '{name}'"
+                        )))
+                    }
+                    Some(Value::Int(c)) => match delta {
+                        Value::Int(d) => {
+                            if let Some(slot) = entity.fields.iter_mut().find(|(n, _)| n == name) {
+                                slot.1 = Value::Int(c.wrapping_add(*d));
+                            }
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgument(format!(
+                                "increment delta for '{name}' must be Int"
+                            )))
+                        }
+                    },
+                    Some(Value::Float(c)) => match delta {
+                        Value::Float(d) => {
+                            if let Some(slot) = entity.fields.iter_mut().find(|(n, _)| n == name) {
+                                slot.1 = Value::Float(c + d);
+                            }
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgument(format!(
+                                "increment delta for '{name}' must be Float"
+                            )))
+                        }
+                    },
+                    Some(other) => {
+                        return Err(Error::InvalidArgument(format!(
+                            "increment on non-numeric field '{name}' (has {other:?})"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Kern-Implementierung von CAS + Partial Update, generalisiert über eine
+/// `Mutator`-Sicht. Direkter Pfad (`EntityStore::cas_update`) und
+/// transaktionaler Pfad (`Transaction::cas_update`) rufen dieselbe Funktion —
+/// identische Semantik, identisches Index-/Hint-Verhalten (ausschliesslich
+/// über den bestehenden [`core_put_entity`]).
+fn core_cas_entity(
+    schema: &mut Schema,
+    m: &mut impl Mutator,
+    hint: Option<&mut HashMap<(u32, Vec<u8>), HashSet<u32>>>,
+    #[cfg(feature = "bench-diag")]
+    value_cache: Option<&mut HashMap<(u32, Vec<u8>), HashMap<u32, Value>>>,
+    collection_id: u32,
+    entity_id: &[u8],
+    expected: &Expected,
+    patch: &[Patch],
+) -> Result<Entity> {
+    // 1. Aktuellen Zustand lesen (committed + ggf. eigene Pending-Writes).
+    let (start, end) = keycodec::entity_range(collection_id, entity_id);
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
+    let current = core_get_entity(schema, &mut DirectScan { rows: &rows }, collection_id, entity_id)?;
+
+    // 2. Bedingung prüfen.
+    match expected {
+        Expected::Any => {}
+        Expected::Absent => {
+            if current.is_some() {
+                return Err(Error::Conflict {
+                    collection_id,
+                    entity_id: String::from_utf8_lossy(entity_id).into_owned(),
+                    reason: ConflictReason::ExpectedAbsentButExists,
+                });
+            }
+        }
+        Expected::Entity(exp) => {
+            let ok = match &current {
+                Some(c) => entity_eq(c, exp),
+                None => false,
+            };
+            if !ok {
+                return Err(Error::Conflict {
+                    collection_id,
+                    entity_id: String::from_utf8_lossy(entity_id).into_owned(),
+                    reason: ConflictReason::ExpectedValueMismatch,
+                });
+            }
+        }
+        Expected::Field(name, val) => {
+            let ok = match &current {
+                Some(c) => c.field(name) == Some(val),
+                None => false,
+            };
+            if !ok {
+                return Err(Error::Conflict {
+                    collection_id,
+                    entity_id: String::from_utf8_lossy(entity_id).into_owned(),
+                    reason: ConflictReason::ExpectedFieldMismatch,
+                });
+            }
+        }
+    }
+
+    // 3. Patch anwenden (auf leere Entität, falls absent).
+    let mut new_entity = current.unwrap_or_else(Entity::new);
+    apply_patch(&mut new_entity, patch)?;
+
+    // 4. Persistieren — ausschliesslich über den bestehenden Pfad.
+    core_put_entity(
+        schema,
+        m,
+        hint,
+        #[cfg(feature = "bench-diag")]
+        value_cache,
+        collection_id,
+        entity_id,
+        &new_entity,
+    )?;
+    Ok(new_entity)
 }
 
 /// Entitäts-Store: hält die KV-Engine + das persistente Schema.
@@ -733,6 +921,41 @@ impl EntityStore {
         Ok(())
     }
 
+    /// Conditional Update (CAS) + Partial Entity Update (v1.2).
+    ///
+    /// Liest die aktuelle Entität, prüft sie gegen `expected`, und — nur bei
+    /// Treffer — wendet die [`Patch`]-Folge an. Der Schreibvorgang läuft
+    /// ausschliesslich über [`core_put_entity`] (Index-/Hint-Pflege
+    /// unverändert). Bei Missmatch liefert `Err(Conflict::Expected*)` und es
+    /// wird **nichts** persistiert. Der direkte Pfad ist atomar via eines
+    /// WAL-Transaction-Blocks (wie ein normaler `commit`).
+    pub fn cas_update(
+        &mut self,
+        collection: &str,
+        entity_id: &str,
+        expected: &Expected,
+        patch: &[Patch],
+    ) -> Result<Entity> {
+        let collection_id = self.schema.collection_id(collection);
+        let new_entity = {
+            let schema = &mut self.schema;
+            let mut m = DirectMutator { db: &mut self.db };
+            core_cas_entity(
+                schema,
+                &mut m,
+                Some(&mut self.field_hint),
+                #[cfg(feature = "bench-diag")]
+                Some(&mut self.value_cache),
+                collection_id,
+                entity_id.as_bytes(),
+                expected,
+                patch,
+            )?
+        };
+        self.persist_schema()?;
+        Ok(new_entity)
+    }
+
     /// Liest eine Entität vollständig aus ihren Feld-Keys und rekonstruiert sie.
     pub fn get_entity(&mut self, collection_id: u32, entity_id: &[u8]) -> Result<Option<Entity>> {
         let mut m = DirectMutator { db: &mut self.db };
@@ -888,6 +1111,40 @@ impl<'a> Transaction<'a> {
             collection_id,
             entity_id.as_bytes(),
             entity,
+        )
+    }
+
+    /// Conditional Update (CAS) + Partial Entity Update innerhalb der
+    /// Transaktion. Identische Semantik wie `EntityStore::cas_update`, jedoch
+    /// über den `TxMutator`: der Vergleich sieht committete **und** eigene
+    /// uncommittete Writes (Read-your-own-writes). Die Mutation landet im
+    /// Pending-Puffer und wird mit dem Transaktions-`commit` atomar
+    /// festgeschrieben (kein Sonderweg für WAL/Index).
+    pub fn cas_update(
+        &mut self,
+        collection: &str,
+        entity_id: &str,
+        expected: &Expected,
+        patch: &[Patch],
+    ) -> Result<Entity> {
+        self.check_active()?;
+        let collection_id = self.store.schema.collection_id(collection);
+        let (schema, db, pending) = (
+            &mut self.store.schema,
+            &mut self.store.db,
+            &mut self.pending,
+        );
+        let mut m = TxMutator { db, pending };
+        core_cas_entity(
+            schema,
+            &mut m,
+            None,
+            #[cfg(feature = "bench-diag")]
+            None,
+            collection_id,
+            entity_id.as_bytes(),
+            expected,
+            patch,
         )
     }
 
