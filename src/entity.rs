@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Index;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::codec::{self, Value};
 use crate::error::{Error, Result};
@@ -668,6 +668,20 @@ impl EntityStore {
     /// Die beim Öffnen ermittelte Format-Version der Datenbank.
     pub fn format_version(&self) -> u32 {
         self.db.format_version()
+    }
+
+    /// Erstellt ein konsistentes Backup der Datenbank (delegiert an
+    /// [`crate::Database::backup`]). Startet exklusiv über `&mut self`;
+    /// pending Direct-Writes werden vor dem Kopieren durch `flush()` persistent
+    /// gemacht.
+    pub fn backup(&mut self, dest: &Path) -> Result<usize> {
+        self.db.backup(dest)
+    }
+
+    /// Stellt eine zuvor erzeugte Backup-Kopie wieder her (delegiert an
+    /// [`crate::Database::restore`]). Siehe Vertrag in [`crate::Database::restore`].
+    pub fn restore(src: &Path, dest: &Path) -> Result<usize> {
+        crate::Database::restore(src, dest)
     }
 
     /// Scannt alle Entities einer Collection. (Auch als Oracle für Tests.)

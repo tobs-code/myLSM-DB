@@ -890,6 +890,153 @@ impl Database {
         Ok(self.manifest.segments.len())
     }
 
+    /// Erstellt eine konsistente, eigenständige Kopie der Datenbank im
+    /// Verzeichnis `dest` (Backup/Restore-Vertrag, Phase H Zweig A).
+    ///
+    /// Vertrag:
+    /// - Startet exklusiv über `&mut self`; pending Direct-Writes werden zuerst
+    ///   durch `flush()` persistent gemacht.
+    /// - Es werden nur die zum committed Manifest gehörenden Dateien kopiert:
+    ///   `VERSION` (falls vorhanden), `MANIFEST`, `SCHEMA` (falls vorhanden)
+    ///   sowie genau die vom Manifest referenzierten `*.sst`. `wal.log`,
+    ///   `*.tmp` und Orphan-`.sst` sind bewusst KEIN Teil des Backup-Roots.
+    /// - Ein halbfertiger Zustand wird niemals als Erfolg gemeldet: schlägt das
+    ///   Kopieren fehl, werden bereits kopierte Dateien und das Zielverzeichnis
+    ///   best-effort entfernt und `Err` zurückgegeben.
+    /// - Keine Cross-Process-Synchronisation (bewusst außerhalb des Vertrags).
+    ///
+    /// Rückgabe: Anzahl kopierter Dateien.
+    pub fn backup(&mut self, dest: &Path) -> Result<usize> {
+        // 1. Pending Direct-Writes persistent machen (Vertragspunkt 2).
+        self.flush()?;
+
+        // 2. Ziel vorbereiten: nicht existent oder leer (kein stilles Überschreiben).
+        if dest.exists() {
+            if !dir_is_empty(dest)? {
+                return Err(error::Error::InvalidArgument(
+                    "backup destination exists and is not empty".into(),
+                ));
+            }
+            std::fs::remove_dir(dest)?;
+        }
+        std::fs::create_dir_all(dest)?;
+
+        // 3. Expliziter Backup-Root (Vertragspunkt 3 + §2).
+        let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let add_if = |from: &Path, files: &mut Vec<(PathBuf, PathBuf)>| {
+            if from.exists() {
+                if let Some(name) = from.file_name() {
+                    files.push((from.to_path_buf(), dest.join(name)));
+                }
+            }
+        };
+        add_if(&self.dir.join("VERSION"), &mut files);
+        add_if(&self.manifest_path, &mut files);
+        add_if(&self.dir.join("SCHEMA"), &mut files);
+        for id in self.manifest.all_ids() {
+            let src = self.table_path(id);
+            if let Some(name) = src.file_name().map(|n| n.to_os_string()) {
+                files.push((src, dest.join(name)));
+            }
+        }
+
+        // 4. Kopieren mit Cleanup bei Fehler (Vertragspunkt 4).
+        let mut copied: Vec<PathBuf> = Vec::new();
+        let res = (|| -> Result<()> {
+            for (from, to) in &files {
+                std::fs::copy(from, to)?;
+                copied.push(to.clone());
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            for p in &copied {
+                let _ = std::fs::remove_file(p);
+            }
+            let _ = std::fs::remove_dir(dest);
+            return Err(e);
+        }
+        Ok(copied.len())
+    }
+
+    /// Stellt eine zuvor via [`Database::backup`] erzeugte Kopie in `dest` wieder
+    /// her (Backup/Restore-Vertrag, Phase H Zweig A).
+    ///
+    /// Vertrag:
+    /// - `src` muss ein gültiger Backup-Root sein (zumindest `MANIFEST`).
+    /// - Versionsprüfung über den v0.9-Mechanismus: eine unvereinbare
+    ///   `VERSION` führt zu [`error::Error::UnsupportedFormatVersion`].
+    /// - `dest` muss leer oder nicht existent sein; eine bestehende Datenbank
+    ///   wird nicht stillschweigend überschrieben (`InvalidArgument`).
+    /// - Es werden nur die Backup-Root-Dateien kopiert (`VERSION`, `MANIFEST`,
+    ///   `SCHEMA`, referenzierte `*.sst`), kein `wal.log`/`*.tmp`/Orphans.
+    /// - Bei Copy-Fehler: best-effort Cleanup, dann `Err`.
+    ///
+    /// Rückgabe: Anzahl kopierter Dateien.
+    pub fn restore(src: &Path, dest: &Path) -> Result<usize> {
+        // 1. Versionsprüfung über den v0.9-Mechanismus (Vertragspunkt 8).
+        match version::read_version(src) {
+            Ok(Some(v)) => version::check_compatible(v)?,
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+
+        // 2. Backup-Root validieren.
+        let src_manifest = src.join("MANIFEST");
+        if !src_manifest.exists() {
+            return Err(error::Error::InvalidFormat("backup missing MANIFEST".into()));
+        }
+
+        // 3. Ziel vorbereiten: leer oder nicht existent (Vertragspunkt 7/9).
+        if dest.exists() {
+            if !dir_is_empty(dest)? {
+                return Err(error::Error::InvalidArgument(
+                    "restore target exists and is not empty".into(),
+                ));
+            }
+            std::fs::remove_dir(dest)?;
+        }
+        std::fs::create_dir_all(dest)?;
+
+        // 4. Expliziten Backup-Root kopieren.
+        let manifest = Manifest::load(&src_manifest)?;
+        let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for name in ["VERSION", "MANIFEST", "SCHEMA"] {
+            let from = src.join(name);
+            if from.exists() {
+                let file_name = from.file_name().map(|n| n.to_os_string());
+                if let Some(n) = file_name {
+                    files.push((from, dest.join(n)));
+                }
+            }
+        }
+        for id in manifest.all_ids() {
+            let name = format!("{:06}.sst", id);
+            let from = src.join(&name);
+            if from.exists() {
+                files.push((from, dest.join(&name)));
+            }
+        }
+
+        // 5. Kopieren mit Cleanup bei Fehler.
+        let mut copied: Vec<PathBuf> = Vec::new();
+        let res = (|| -> Result<()> {
+            for (from, to) in &files {
+                std::fs::copy(from, to)?;
+                copied.push(to.clone());
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            for p in &copied {
+                let _ = std::fs::remove_file(p);
+            }
+            let _ = std::fs::remove_dir(dest);
+            return Err(e);
+        }
+        Ok(copied.len())
+    }
+
     /// Schließt die Datenbank OHNE Flush (rein lesend). Verhindert, dass der
     /// `Drop` noch ein Flush/WAL-Sync auslöst. Für `inspect`/`stats`, die die
     /// DB nicht mutieren dürfen.
@@ -938,7 +1085,13 @@ impl Database {
 
 /// Best-Effort-Fallback: Flusht beim Verwerfen, wenn `close()` nicht explizit
 /// gerufen wurde. Fehler werden ignoriert — `close()` ist die zuverlässige API.
-/// Hilfsfunktion: Bytes als Kleinbuchstaben-Hex (für inspect-Ausgabe).
+/// Prüft, ob ein Verzeichnis existiert und keine Einträge enthält.
+fn dir_is_empty(path: &Path) -> Result<bool> {
+    let mut it = std::fs::read_dir(path)?;
+    Ok(it.next().is_none())
+}
+
+/// Hilfsfunktion: Bytes als Kleinbuchstaben Hex (für inspect-Ausgabe).
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);

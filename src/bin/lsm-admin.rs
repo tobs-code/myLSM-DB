@@ -1,8 +1,9 @@
-//! myLSM-DB Admin-CLI (v1.0): inspect / stats / compact / gc.
+//! myLSM-DB Admin-CLI (v1.0 + v1.1): inspect / stats / compact / gc / backup / restore.
 //!
 //! Öffnet die Datenbank unter `--dir` (Default `.`) und führt den Befehl aus.
 //! `inspect`/`stats` sind rein lesend (kein Flush/Drop-Mutation); `compact`/
 //! `gc` mutieren gezielt und bleiben beim etablierten Durability-Vertrag.
+//! `backup`/`restore` folgen dem Backup/Restore-Vertrag (Phase H Zweig A).
 //!
 //! Exit-Codes: 0 = ok, 1 = Laufzeitfehler (Open/Operation), 2 = Aufruffehler.
 
@@ -22,11 +23,12 @@ fn main() {
 fn run(args: &[String]) -> Result<(), i32> {
     let mut dir = PathBuf::from(".");
     let mut command: Option<&str> = None;
+    let mut positionals: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "inspect" | "stats" | "compact" | "gc" => {
+            "inspect" | "stats" | "compact" | "gc" | "backup" | "restore" => {
                 if command.is_some() {
                     eprintln!("error: multiple commands given");
                     return Err(2);
@@ -42,8 +44,11 @@ fn run(args: &[String]) -> Result<(), i32> {
                 dir = PathBuf::from(&args[i]);
             }
             other => {
-                eprintln!("error: unknown argument: {other}");
-                return Err(2);
+                if other.starts_with("--") {
+                    eprintln!("error: unknown argument: {other}");
+                    return Err(2);
+                }
+                positionals.push(other.to_string());
             }
         }
         i += 1;
@@ -52,7 +57,9 @@ fn run(args: &[String]) -> Result<(), i32> {
     let command = match command {
         Some(c) => c,
         None => {
-            eprintln!("usage: lsm-admin <inspect|stats|compact|gc> [--dir <path>]");
+            eprintln!(
+                "usage: lsm-admin <inspect|stats|compact|gc|backup|restore> [--dir <path>] <args...>"
+            );
             return Err(2);
         }
     };
@@ -62,6 +69,33 @@ fn run(args: &[String]) -> Result<(), i32> {
         "stats" => cmd_stats(&dir),
         "compact" => cmd_compact(&dir),
         "gc" => cmd_gc(&dir),
+        "backup" => {
+            let dest = match positionals.get(0) {
+                Some(d) => PathBuf::from(d),
+                None => {
+                    eprintln!("error: backup requires <dest>");
+                    return Err(2);
+                }
+            };
+            cmd_backup(&dir, &dest)
+        }
+        "restore" => {
+            let src = match positionals.get(0) {
+                Some(s) => PathBuf::from(s),
+                None => {
+                    eprintln!("error: restore requires <src> <dest>");
+                    return Err(2);
+                }
+            };
+            let dest = match positionals.get(1) {
+                Some(d) => PathBuf::from(d),
+                None => {
+                    eprintln!("error: restore requires <src> <dest>");
+                    return Err(2);
+                }
+            };
+            cmd_restore(&src, &dest)
+        }
         _ => unreachable!(),
     }
 }
@@ -182,6 +216,30 @@ fn cmd_gc(dir: &PathBuf) -> Result<(), i32> {
         1
     })?;
     println!("gc: removed {removed} orphan sst files");
+    Ok(())
+}
+
+fn cmd_backup(dir: &PathBuf, dest: &PathBuf) -> Result<(), i32> {
+    let mut db = open_ro(dir)?;
+    let n = db.backup(dest).map_err(|e| {
+        eprintln!("error: {e}");
+        1
+    })?;
+    // Durability: backup hat bereits geflusht; close() persitiert den Rest sauber.
+    db.close().map_err(|e| {
+        eprintln!("error: {e}");
+        1
+    })?;
+    println!("backup: wrote {n} files to {}", dest.display());
+    Ok(())
+}
+
+fn cmd_restore(src: &PathBuf, dest: &PathBuf) -> Result<(), i32> {
+    let n = Database::restore(src, dest).map_err(|e| {
+        eprintln!("error: {e}");
+        1
+    })?;
+    println!("restore: wrote {n} files to {}", dest.display());
     Ok(())
 }
 
