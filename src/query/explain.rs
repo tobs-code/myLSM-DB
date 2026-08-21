@@ -28,6 +28,23 @@ fn write_node(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 format_range(lower, upper)
             ));
         }
+        PhysicalPlan::CompositeIndexScan {
+            collection,
+            field_ids,
+            leading,
+            ..
+        } => {
+            let comps = leading
+                .iter()
+                .map(|(pos, lo, hi)| format!("c{pos}:{}", format_range(lo, hi)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!(
+                "CompositeIndexScan {{ collection: {collection}, fields: [{}], leading: [{}] }}",
+                field_ids.join(", "),
+                comps
+            ));
+        }
         PhysicalPlan::IndexOrderScan {
             collection,
             field,

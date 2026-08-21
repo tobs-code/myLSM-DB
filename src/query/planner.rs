@@ -342,17 +342,127 @@ fn clause_residual(lits: &[Lit]) -> Predicate {
     p
 }
 
+/// Wählt den besten nutzbaren Composite-Index für eine Klausel (v1.3).
+///
+/// Ein Composite-Index mit Feld-Set `[f0, f1, ...]` ist nutzbar, wenn die
+/// Klausel eine **führende Präfix**-Bindung liefert: Komponente `i` muss
+/// gebunden sein, sofern alle `0..i-1` gebunden sind. Komponente `i` darf
+/// Equality ODER Range sein; eine Range-Komponente beendet den nutzbaren
+/// Präfix (es kann nichts Folgendes mehr eingeengt werden). Geliefert wird
+/// `(index_id, field_ids, leading)`, wobei `leading` die gebundenen Komponenten
+/// als `(Positionsindex, Untergrenze, Obergrenze)` enthält.
+fn pick_composite_index(
+    clause: &[Lit],
+    schema: &Schema,
+    collection_id: u32,
+) -> Option<(u32, Vec<u32>, Vec<(usize, Bound, Bound)>)> {
+    let candidates: Vec<(u32, Vec<u32>)> = schema
+        .indexes()
+        .iter()
+        .filter(|i| {
+            i.collection_id == collection_id
+                && i.status == IndexStatus::Ready
+                && i.field_ids.len() >= 2
+        })
+        .map(|i| (i.id, i.field_ids.clone()))
+        .collect();
+    // best = (führende_länge, field_ids_tiebreak, index_id, leading)
+    let mut best: Option<(usize, Vec<u32>, u32, Vec<(usize, Bound, Bound)>)> = None;
+    for (idx_id, fids) in candidates {
+        let mut leading: Vec<(usize, Bound, Bound)> = Vec::new();
+        let mut ok = true;
+        for (pos, &fid) in fids.iter().enumerate() {
+            let name = match schema.field_name(collection_id, fid) {
+                Some(n) => n.to_string(),
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            let lit = clause.iter().find(|l| l.field == name && l.indexable());
+            match lit {
+                None => break, // Präfix endet hier
+                Some(l) => {
+                    let (lo, hi) = merge_bounds(clause, &name);
+                    leading.push((pos, lo, hi));
+                    if l.cmp != Cmp::Eq {
+                        break; // Range-Komponente beendet den nutzbaren Präfix
+                    }
+                }
+            }
+        }
+        if !ok || leading.is_empty() {
+            continue;
+        }
+        let cand = (leading.len(), fids.clone(), idx_id, leading.clone());
+        best = Some(match best {
+            None => cand,
+            Some(b) => {
+                if cand.0 > b.0 || (cand.0 == b.0 && cand.1 < b.1) {
+                    cand
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    best.map(|(_, fids, idx_id, leading)| (idx_id, fids, leading))
+}
+
 /// Erzeugt den Zeilen-/Zweig-Plan (ID-Source) für eine einzelne AND-Klausel.
 ///
 /// Gibt `(row_source, residual_lits)` zurück, wobei `row_source` eine
-/// Entity-Zeilenquelle ist: `Fetch{IndexScan}` oder `FullScan`.
+/// Entity-Zeilenquelle ist: `Fetch{IndexScan}`, `Fetch{CompositeIndexScan}`
+/// oder `FullScan`. Ein Composite-Index wird einem Single-Field-Index
+/// vorgezogen, sobald er **mindestens zwei** führende Komponenten nutzen kann;
+/// bei nur einer nutzbaren Komponente wird er nur gewählt, wenn kein
+/// Single-Field-Index verfügbar ist.
 fn plan_clause(
     schema: &Schema,
     collection: &str,
     collection_id: u32,
     clause: &[Lit],
 ) -> (PhysicalPlan, Vec<Lit>) {
-    if let Some(field) = pick_index_field_cost(clause, schema, collection_id) {
+    let single = pick_index_field_cost(clause, schema, collection_id);
+    let composite = pick_composite_index(clause, schema, collection_id);
+    let composite_usable = composite.as_ref().map_or(0, |(_, _, l)| l.len());
+    let use_composite = if composite_usable >= 2 {
+        true
+    } else if composite_usable == 1 {
+        single.is_none()
+    } else {
+        false
+    };
+
+    if use_composite {
+        let (index_id, fids, leading) = composite.unwrap();
+        let field_names: Vec<String> = fids
+            .iter()
+            .map(|f| schema.field_name(collection_id, *f).unwrap().to_string())
+            .collect();
+        let node = PhysicalPlan::CompositeIndexScan {
+            collection: collection.to_string(),
+            index_id,
+            field_ids: field_names,
+            leading: leading.clone(),
+        };
+        let fetch = PhysicalPlan::Fetch {
+            input: Box::new(node),
+            collection: collection.to_string(),
+        };
+        // Residual: alle durch den Composite-Index abgedeckten Literale entfernen.
+        let residual: Vec<Lit> = clause
+            .iter()
+            .filter(|l| {
+                !leading.iter().any(|(pos, _, _)| {
+                    let fname = schema.field_name(collection_id, fids[*pos]).unwrap();
+                    l.field == fname && l.indexable()
+                })
+            })
+            .cloned()
+            .collect();
+        (fetch, residual)
+    } else if let Some(field) = single {
         let (lower, upper) = merge_bounds(clause, field);
         let index = PhysicalPlan::IndexScan {
             collection: collection.to_string(),

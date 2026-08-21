@@ -24,7 +24,7 @@ use crate::codec::{self, Value};
 use crate::error::{Error, Result};
 use crate::keycodec;
 use crate::ordering;
-use crate::schema::Schema;
+use crate::schema::{IndexStatus, Schema};
 use crate::{Database, DirectMutator, Mutator};
 
 /// Unter-/Obergrenze eines Index-Bereichs.
@@ -180,6 +180,228 @@ pub fn find(
 ) -> Result<Vec<String>> {
     let mut m = DirectMutator { db };
     find_m(&mut m, schema, collection_id, field_id, lower, upper)
+}
+
+/// Scan-Bereich im Composite-Index-Key-Raum.
+///
+/// `leading` sind die gebundenen Komponenten in aufsteigender Positionsreihenfolge
+/// (Index in `field_ids`): Komponente `0..L-1` müssen Equality sein; Komponente
+/// `L-1` darf ein beliebiger Bereich sein. Die Berechnung hängt die encodierten
+/// Werte (bzw. deren Successor) in der korrekten Reihenfolge an das
+/// Index-Präfix — dank selbst-delimitierender `encode_ordered`-Werte bleibt das
+/// präfix-sortierbar.
+fn composite_index_range(
+    collection_id: u32,
+    index_id: u32,
+    leading: &[(usize, Bound, Bound)],
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    use Bound::*;
+    let prefix = keycodec::composite_prefix(collection_id, index_id);
+    let n = leading.len();
+    // Equality-Präfix aus allen bis auf die letzte Komponente.
+    let mut eq_prefix = prefix.clone();
+    for i in 0..n.saturating_sub(1) {
+        let (_, lo, _hi) = &leading[i];
+        match lo {
+            Inclusive(v) => eq_prefix.extend_from_slice(&ordering::encode_ordered(v)),
+            // Ungültig (nicht-Equality in Zwischenposition): ganzer Präfix-Scan.
+            _ => return (prefix.clone(), keycodec::successor(&prefix)),
+        }
+    }
+    let mut start = eq_prefix.clone();
+    let end = if n > 0 {
+        let (_, lo, hi) = &leading[n - 1];
+        match lo {
+            Unbounded => {}
+            Inclusive(v) => start.extend_from_slice(&ordering::encode_ordered(v)),
+            Exclusive(v) => {
+                if let Some(s) = keycodec::successor(&ordering::encode_ordered(v)) {
+                    start.extend_from_slice(&s);
+                }
+            }
+        }
+        match hi {
+            Unbounded => keycodec::successor(&eq_prefix).unwrap_or_else(|| eq_prefix.clone()),
+            Inclusive(v) => {
+                let suffix = keycodec::successor(&ordering::encode_ordered(v)).unwrap_or_default();
+                let mut e = eq_prefix.clone();
+                e.extend_from_slice(&suffix);
+                e
+            }
+            Exclusive(v) => {
+                let mut e = eq_prefix.clone();
+                e.extend_from_slice(&ordering::encode_ordered(v));
+                e
+            }
+        }
+    } else {
+        keycodec::successor(&prefix).unwrap_or_else(|| prefix.clone())
+    };
+    (start, Some(end))
+}
+
+/// Dekodiert einen Composite-Index-Key in `(Komponenten-Werte, Entity-ID)`.
+/// `Ok(None)`, wenn der Key kein Composite-Index-Key ist; Fehler bei
+/// unlesbarem Wert oder nicht-UTF-8-ID.
+pub(crate) fn decode_composite_key_value(
+    key: &[u8],
+    n_components: usize,
+) -> Result<Option<(Vec<Value>, String)>> {
+    if key.len() < 1 + 4 + 4 + 4 + 4 || key[0] != keycodec::INDEX_TAG {
+        return Ok(None);
+    }
+    let mut off = 1;
+    let _cid = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
+    off += 4;
+    let marker = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
+    off += 4;
+    if marker != keycodec::COMPOSITE_FIELD_MARKER {
+        return Ok(None);
+    }
+    let _index_id = u32::from_le_bytes(key[off..off + 4].try_into().unwrap());
+    off += 4;
+    let mut comps = Vec::with_capacity(n_components);
+    for _ in 0..n_components {
+        let len = ordering::ordered_value_len(&key[off..])?;
+        let v = ordering::decode_ordered(&key[off..off + len])?;
+        comps.push(v);
+        off += len;
+    }
+    if off + 4 > key.len() {
+        return Ok(None);
+    }
+    let eid_len = u32::from_le_bytes(key[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    if off + eid_len > key.len() {
+        return Ok(None);
+    }
+    let eid = crate::keycodec::decode_entity_id(&key[off..off + eid_len])?.to_string();
+    Ok(Some((comps, eid)))
+}
+
+/// Führt eine Composite-Index-Abfrage über eine beliebige Mutator-Sicht aus.
+/// Liefert die **verifizierten** Entity-IDs (gegen die echten Komponenten-
+/// Werte der Entity — der Index ist nie die Wahrheit).
+pub(crate) fn find_composite_m<M: Mutator>(
+    m: &mut M,
+    schema: &Schema,
+    collection_id: u32,
+    index_id: u32,
+    n_components: usize,
+    leading: &[(usize, Bound, Bound)],
+) -> Result<Vec<String>> {
+    let Some(def) = schema.index_by_id(index_id) else {
+        return Err(Error::InvalidArgument("composite index not found".into()));
+    };
+    if def.status != IndexStatus::Ready {
+        return Err(Error::InvalidArgument("composite index not ready".into()));
+    }
+    let fids = def.field_ids.clone();
+    let (start, end) = composite_index_range(collection_id, index_id, leading);
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = m
+        .scan(Some(&start), end.as_deref())?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (key, _) in rows {
+        let Some((_comps, eid)) = decode_composite_key_value(&key, n_components)? else {
+            continue;
+        };
+        // Verifikation gegen die echten Entity-Werte (Index ist nie die
+        // Wahrheit): ein veralteter Composite-Eintrag darf keine False
+        // Positive erzeugen. Ein fehlendes Feld (`absent`) erfüllt keinen
+        // konkreten Bereich → Kandidat fällt weg.
+        let mut ok = true;
+        for (idx, lo, hi) in leading {
+            let actual = field_value_m(m, collection_id, eid.as_bytes(), fids[*idx])?;
+            match actual {
+                None => {
+                    ok = false;
+                    break;
+                }
+                Some(v) => {
+                    if !within(&v, lo, hi) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if !seen.insert(eid.clone()) {
+            continue;
+        }
+        ids.push(eid);
+    }
+    Ok(ids)
+}
+
+/// Löscht alle Composite-Index-Keys eines (collection, index).
+pub fn clear_composite(db: &mut Database, collection_id: u32, index_id: u32) -> Result<()> {
+    let start = keycodec::composite_prefix(collection_id, index_id);
+    let end = keycodec::successor(&start).ok_or_else(|| {
+        Error::InvalidFormat("composite prefix has no successor".into())
+    })?;
+    let rows = db.scan(Some(&start), Some(&end))?;
+    for (key, _) in rows {
+        db.delete(&key)?;
+    }
+    Ok(())
+}
+
+/// Baut einen Composite-Index (vollständig) neu auf: erst alle alten
+/// Composite-Index-Keys löschen, dann pro Entity das Tupel der `field_ids`
+/// rekonstruieren und — falls **alle** Komponenten vorhanden sind — den
+/// Composite-Key schreiben. Idempotent (ideal für Recovery nach Crash).
+pub fn rebuild_composite(
+    db: &mut Database,
+    collection_id: u32,
+    index_id: u32,
+    field_ids: &[u32],
+) -> Result<()> {
+    clear_composite(db, collection_id, index_id)?;
+    let pstart = keycodec::collection_prefix(collection_id);
+    let pend = keycodec::successor(&pstart).ok_or_else(|| {
+        Error::InvalidFormat("collection prefix has no successor".into())
+    })?;
+    let rows = db.scan(Some(&pstart), Some(&pend))?;
+    // Feld-Keys pro Entity sammeln.
+    let mut entity_fields: std::collections::HashMap<Vec<u8>, std::collections::HashMap<u32, Value>> =
+        std::collections::HashMap::new();
+    for (key, value_opt) in rows {
+        let Some((_, ee, ef)) = keycodec::decode_entity_key(&key) else {
+            continue;
+        };
+        if let Some(bytes) = value_opt {
+            if let Ok(val) = codec::decode(&bytes) {
+                entity_fields
+                    .entry(ee.to_vec())
+                    .or_default()
+                    .insert(ef, val);
+            }
+        }
+    }
+    for (eid, fields) in entity_fields {
+        let mut comps: Vec<Vec<u8>> = Vec::with_capacity(field_ids.len());
+        let mut complete = true;
+        for &fid in field_ids {
+            match fields.get(&fid) {
+                Some(v) => comps.push(ordering::encode_ordered(v)),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue; // fehlende Komponente → keine Composite-Index-Zeile
+        }
+        let ik = keycodec::encode_composite_index_key(collection_id, index_id, &comps, &eid);
+        db.put(&ik, &[])?;
+    }
+    Ok(())
 }
 
 /// Löscht alle Index-Keys eines (collection, field).

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codec::{self, Value};
 use crate::error::{ConflictReason, Error, Result};
-use crate::index::{self, FindOp};
+use crate::index::{self, Bound, FindOp};
 use crate::keycodec;
 use crate::ordering;
 use crate::query::{self, QueryBuilder};
@@ -426,14 +426,45 @@ impl<'s> Iterator for TxScan<'s> {
     }
 }
 
-/// READY-Index-Feld-IDs einer Collection.
+/// READY-Single-Field-Index-Feld-IDs einer Collection (Composite-Indizes
+/// mit `field_ids.len() >= 2` sind hier ausgeschlossen).
 fn indexed_field_ids(schema: &Schema, collection_id: u32) -> Vec<u32> {
     schema
         .indexes()
         .iter()
         .filter(|i| i.collection_id == collection_id && i.status == IndexStatus::Ready)
-        .map(|i| i.field_id)
+        .filter(|i| i.field_ids.len() == 1)
+        .map(|i| i.field_ids[0])
         .collect()
+}
+
+/// READY-Composite-Index-Definitionen `(index_id, field_ids)` einer Collection
+/// (nur Indizes mit `field_ids.len() >= 2`).
+fn composite_index_defs(schema: &Schema, collection_id: u32) -> Vec<(u32, Vec<u32>)> {
+    schema
+        .indexes()
+        .iter()
+        .filter(|i| i.collection_id == collection_id && i.status == IndexStatus::Ready)
+        .filter(|i| i.field_ids.len() >= 2)
+        .map(|i| (i.id, i.field_ids.clone()))
+        .collect()
+}
+
+/// Liefert zu einem Composite-Index die neuen und alten Komponenten-Tupel.
+/// Eine Komponente ist `None`, wenn ihr Feld auf der jeweiligen Seite fehlt
+/// (`absent` — kein Eintrag im Composite-Index).
+fn composite_tuples(
+    written: &[(u32, &Value)],
+    old_values: &HashMap<u32, Value>,
+    fids: &[u32],
+) -> (Vec<Option<Value>>, Vec<Option<Value>>) {
+    let new_tuple: Vec<Option<Value>> = fids
+        .iter()
+        .map(|fid| written.iter().find(|(f, _)| *f == *fid).map(|(_, v)| (*v).clone()))
+        .collect();
+    let old_tuple: Vec<Option<Value>> =
+        fids.iter().map(|fid| old_values.get(fid).cloned()).collect();
+    (new_tuple, old_tuple)
 }
 
 /// Kern-Implementierung von `put_entity`, generalisiert über eine Mutator-Sicht
@@ -486,6 +517,18 @@ fn core_put_entity(
     #[cfg(feature = "bench-diag")]
     let t_idxf = std::time::Instant::now();
     let indexed = indexed_field_ids(schema, collection_id);
+    let composites = composite_index_defs(schema, collection_id);
+    let composite_field_ids: HashSet<u32> = composites
+        .iter()
+        .flat_map(|(_, fids)| fids.iter().copied())
+        .collect();
+    // Feld-IDs, deren alte Werte für den Index-Diff (Single ODER Composite)
+    // benötigt werden.
+    let need_old: HashSet<u32> = indexed
+        .iter()
+        .copied()
+        .chain(composite_field_ids.iter().copied())
+        .collect();
     #[cfg(feature = "bench-diag")]
     if crate::diag::active() {
         crate::diag::add_idx_fields_us(t_idxf.elapsed().as_micros() as u64);
@@ -523,7 +566,7 @@ fn core_put_entity(
                     let k = keycodec::encode_entity_key(collection_id, entity_id, fid);
                     if let Some(bytes) = m.get(&k)? {
                         stale_keys.push(k);
-                        if indexed.contains(&fid) {
+                        if need_old.contains(&fid) {
                             if let Ok(v) = codec::decode(&bytes) {
                                 old_values.insert(fid, v);
                             }
@@ -534,7 +577,7 @@ fn core_put_entity(
                 // Prototyp: Cache-Hit liefert den Wert ohne Disk-Read (→ get_us ≈ 0);
                 // Cache-Miss fällt exakt auf den bestehenden Point-Lookup zurück.
                 for (fid, _value) in &written {
-                    if !indexed.contains(fid) {
+                    if !need_old.contains(fid) {
                         continue;
                     }
                     #[cfg(feature = "bench-diag")]
@@ -605,6 +648,30 @@ fn core_put_entity(
         }
     }
 
+    // 1b) Neue Composite-Index-Einträge für geänderte Tupel schreiben
+    //     (vor der Entity-Aktualisierung → kein False Negative).
+    for (index_id, fids) in &composites {
+        let (new_tuple, old_tuple) = composite_tuples(&written, &old_values, fids);
+        let new_complete = new_tuple.iter().all(|o| o.is_some());
+        let old_complete = old_tuple.iter().all(|o| o.is_some());
+        let changed = new_tuple != old_tuple;
+        if changed && new_complete {
+            let comps: Vec<Vec<u8>> = new_tuple
+                .iter()
+                .map(|o| ordering::encode_ordered(o.as_ref().unwrap()))
+                .collect();
+            let ik = keycodec::encode_composite_index_key(
+                collection_id,
+                *index_id,
+                &comps,
+                entity_id,
+            );
+            m.put(&ik, &[])?;
+        }
+        // Alte (veraltete) Composite-Keys werden in Phase 3 gelöscht.
+        let _ = old_complete;
+    }
+
     // 2) Entity-Felder schreiben + veraltete entfernen.
     for key in &stale_keys {
         m.delete(key)?;
@@ -639,6 +706,29 @@ fn core_put_entity(
             );
             m.delete(&ik)?;
         }
+    }
+
+    // 3b) Alte Composite-Index-Einträge löschen — erst nachdem die Entity das
+    //     Tupel nicht mehr hat (sonst entstünde ein False Negative).
+    for (index_id, fids) in &composites {
+        let (new_tuple, old_tuple) = composite_tuples(&written, &old_values, fids);
+        let new_complete = new_tuple.iter().all(|o| o.is_some());
+        let old_complete = old_tuple.iter().all(|o| o.is_some());
+        let changed = new_tuple != old_tuple;
+        if changed && old_complete {
+            let comps: Vec<Vec<u8>> = old_tuple
+                .iter()
+                .map(|o| ordering::encode_ordered(o.as_ref().unwrap()))
+                .collect();
+            let ik = keycodec::encode_composite_index_key(
+                collection_id,
+                *index_id,
+                &comps,
+                entity_id,
+            );
+            m.delete(&ik)?;
+        }
+        let _ = new_complete;
     }
 
     // Hint aktualisieren: Die Entity hat danach genau die geschriebenen Felder.
@@ -677,27 +767,60 @@ fn core_delete_entity(
     // Erst die Feldwerte einsammeln (für die Index-Bereinigung) und die
     // Entity-Keys löschen; danach die Index-Einträge entfernen.
     let indexed = indexed_field_ids(schema, collection_id);
-    let mut index_ops: Vec<(u32, Value)> = Vec::new();
+    let composites = composite_index_defs(schema, collection_id);
+    let composite_field_ids: HashSet<u32> = composites
+        .iter()
+        .flat_map(|(_, fids)| fids.iter().copied())
+        .collect();
+    let mut field_vals: HashMap<u32, Value> = HashMap::new();
     for (key, value_opt) in &rows {
         if let Some((_, _, field_id)) = keycodec::decode_entity_key(key) {
-            if indexed.contains(&field_id) {
+            let needed =
+                indexed.contains(&field_id) || composite_field_ids.contains(&field_id);
+            if needed {
                 if let Some(v) = value_opt {
                     if let Ok(val) = codec::decode(v) {
-                        index_ops.push((field_id, val));
+                        field_vals.insert(field_id, val);
                     }
                 }
             }
             m.delete(key)?;
         }
     }
-    for (field_id, value) in index_ops {
-        let ik = keycodec::encode_index_key(
-            collection_id,
-            field_id,
-            &ordering::encode_ordered(&value),
-            entity_id,
-        );
-        m.delete(&ik)?;
+    // Single-Field-Index-Einträge löschen.
+    for (field_id, value) in &field_vals {
+        if indexed.contains(field_id) {
+            let ik = keycodec::encode_index_key(
+                collection_id,
+                *field_id,
+                &ordering::encode_ordered(value),
+                entity_id,
+            );
+            m.delete(&ik)?;
+        }
+    }
+    // Composite-Index-Einträge löschen (nur bei vollständigem Tupel).
+    for (index_id, fids) in &composites {
+        let mut comps: Vec<Vec<u8>> = Vec::with_capacity(fids.len());
+        let mut complete = true;
+        for &fid in fids {
+            match field_vals.get(&fid) {
+                Some(v) => comps.push(ordering::encode_ordered(v)),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            let ik = keycodec::encode_composite_index_key(
+                collection_id,
+                *index_id,
+                &comps,
+                entity_id,
+            );
+            m.delete(&ik)?;
+        }
     }
     Ok(())
 }
@@ -989,7 +1112,25 @@ impl EntityStore {
         Ok(())
     }
 
-    /// Löscht einen Index (Definition + alle Index-Keys).
+    /// Legt einen Composite-Index über ein Feld-Set an (v1.3). Bei einem einzigen
+    /// Feld entspricht das einem Single-Field-Index. Statuswechsel wie
+    /// [`create_index`].
+    pub fn create_composite_index(
+        &mut self,
+        collection_id: u32,
+        field_ids: &[u32],
+    ) -> Result<()> {
+        let id = self
+            .schema
+            .create_composite_index(collection_id, field_ids);
+        self.schema.save(&self.schema_path)?; // BUILDING dauerhaft
+        index::rebuild_composite(&mut self.db, collection_id, id, field_ids)?;
+        self.schema.set_index_ready(id);
+        self.schema.save(&self.schema_path)?; // READY dauerhaft
+        Ok(())
+    }
+
+    /// Löscht einen Single-Field-Index (Definition + alle Index-Keys).
     pub fn drop_index(&mut self, collection_id: u32, field_id: u32) -> Result<()> {
         if let Some(def) = self.schema.find_index(collection_id, field_id) {
             index::clear(&mut self.db, collection_id, field_id)?;
@@ -999,16 +1140,37 @@ impl EntityStore {
         Ok(())
     }
 
+    /// Löscht einen Composite-Index (über ein exaktes Feld-Set).
+    pub fn drop_composite_index(
+        &mut self,
+        collection_id: u32,
+        field_ids: &[u32],
+    ) -> Result<()> {
+        if let Some(def) = self
+            .schema
+            .find_index_by_fields(collection_id, field_ids)
+        {
+            index::clear_composite(&mut self.db, collection_id, def.id)?;
+            self.schema.drop_index(def.id);
+            self.schema.save(&self.schema_path)?;
+        }
+        Ok(())
+    }
+
     /// Baut alle noch nicht fertigen Indizes nach einem Open neu auf
     /// (idempotent, vollständiger Rebuild statt Reparatur).
     fn recover_indexes(&mut self) -> Result<()> {
-        let pending: Vec<(u32, u32)> = self
+        let pending: Vec<(u32, Vec<u32>)> = self
             .schema
             .building_indexes()
-            .map(|i| (i.collection_id, i.field_id))
+            .map(|i| (i.collection_id, i.field_ids.clone()))
             .collect();
-        for (c, f) in pending {
-            self.create_index(c, f)?;
+        for (c, fids) in pending {
+            if fids.len() == 1 {
+                self.create_index(c, fids[0])?;
+            } else {
+                self.create_composite_index(c, &fids)?;
+            }
         }
         Ok(())
     }
@@ -1427,6 +1589,62 @@ impl<'a> CollectionHandle<'a> {
             None => return Ok(()),
         };
         self.store.drop_index(self.collection_id, field_id)
+    }
+
+    /// Legt einen Composite-Index über mehrere Felder an (v1.3).
+    pub fn create_composite_index(&mut self, fields: &[&str]) -> Result<()> {
+        let field_ids: Vec<u32> = fields
+            .iter()
+            .map(|f| self.store.schema.field_id(self.collection_id, f))
+            .collect();
+        self.store
+            .create_composite_index(self.collection_id, &field_ids)
+    }
+
+    /// Löscht den Composite-Index über `fields` (falls existent).
+    pub fn drop_composite_index(&mut self, fields: &[&str]) -> Result<()> {
+        let field_ids: Vec<u32> = fields
+            .iter()
+            .filter_map(|f| self.store.schema.lookup_field_id(self.collection_id, f))
+            .collect();
+        if field_ids.len() == fields.len() {
+            self.store
+                .drop_composite_index(self.collection_id, &field_ids)?;
+        }
+        Ok(())
+    }
+
+    /// Führt eine Composite-Index-Abfrage aus und liefert die verifizierten
+    /// Entity-IDs. `fields` ist die Reihenfolge des Composite-Index;
+    /// `leading` sind die gebundenen Komponenten `(Positionsindex, Untergrenze,
+    /// Obergrenze)` — Komponente `0..L-1` müssen Equality sein, `L-1` darf ein
+    /// Bereich sein.
+    pub fn find_composite(
+        &mut self,
+        fields: &[&str],
+        leading: &[(usize, Bound, Bound)],
+    ) -> Result<Vec<String>> {
+        let field_ids: Vec<u32> = fields
+            .iter()
+            .filter_map(|f| self.store.schema.lookup_field_id(self.collection_id, f))
+            .collect();
+        if field_ids.len() != fields.len() {
+            return Err(Error::InvalidArgument("unknown composite field".into()));
+        }
+        let def = self
+            .store
+            .schema
+            .find_index_by_fields(self.collection_id, &field_ids)
+            .ok_or_else(|| Error::InvalidArgument("no composite index on fields".into()))?;
+        let mut m = DirectMutator { db: &mut self.store.db };
+        index::find_composite_m(
+            &mut m,
+            &self.store.schema,
+            self.collection_id,
+            def.id,
+            field_ids.len(),
+            leading,
+        )
     }
 
     /// Führt eine Index-Abfrage aus und liefert die verifizierten Entity-IDs.

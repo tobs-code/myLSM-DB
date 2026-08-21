@@ -77,6 +77,11 @@ fn exec_rows<'m, M: Mutator>(
             let collection = plan.collection().unwrap_or("");
             Ok(fetch_stream(m, schema, ids, collection))
         }
+        PhysicalPlan::CompositeIndexScan { .. } => {
+            let ids = candidate_ids(m, schema, plan)?;
+            let collection = plan.collection().unwrap_or("");
+            Ok(fetch_stream(m, schema, ids, collection))
+        }
         PhysicalPlan::Fetch { input, collection } => {
             let ids = candidate_ids(m, schema, input)?;
             Ok(fetch_stream(m, schema, ids, collection))
@@ -132,6 +137,12 @@ fn candidate_ids<M: Mutator>(
             lower,
             upper,
         } => index_scan(m, schema, collection, field, lower, upper),
+        PhysicalPlan::CompositeIndexScan {
+            collection,
+            index_id,
+            field_ids,
+            leading,
+        } => index_composite_scan(m, schema, collection, *index_id, field_ids, leading),
         PhysicalPlan::UnionIds { branches } => {
             let mut out: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
@@ -288,6 +299,23 @@ fn index_scan<M: Mutator>(
         return Err(Error::InvalidArgument(format!("no index on field {field}")));
     }
     index::find_m(m, schema, cid, fid, lower, upper)
+}
+
+/// Führt einen Composite-Index-Scan aus und liefert die verifizierten
+/// Entity-IDs. Die Feldnamen dienen nur dem Mapping; die Komponentenanzahl
+/// (`field_ids.len()`) bestimmt die Dekodierung.
+fn index_composite_scan<M: Mutator>(
+    m: &mut M,
+    schema: &Schema,
+    collection: &str,
+    index_id: u32,
+    field_ids: &[String],
+    leading: &[(usize, index::Bound, index::Bound)],
+) -> Result<Vec<String>> {
+    let Some(cid) = schema.lookup_collection_id(collection) else {
+        return Ok(Vec::new());
+    };
+    index::find_composite_m(m, schema, cid, index_id, field_ids.len(), leading)
 }
 
 /// Baut den (bounded) Index-Order-Scan: sammelt die Kandidaten-IDs des

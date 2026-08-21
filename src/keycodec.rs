@@ -80,6 +80,45 @@ pub fn index_value_prefix(collection_id: u32, field_id: u32, encoded_value: &[u8
     out
 }
 
+/// Reservierter Marker im `field_id`-Slot eines Composite-Index-Keys. Er
+/// kollidiert mit keinem echten `field_id` (Schema vergibt nie `0xFFFFFFFF`)
+/// und trennt Composite- von Single-Field-Index-Keys sauber im selben
+/// Key-Raum (`I | cid | ...`).
+pub const COMPOSITE_FIELD_MARKER: u32 = 0xFFFF_FFFF;
+
+/// Präfix aller Composite-Index-Keys eines (collection, index):
+/// `[I][cid u32 LE][0xFFFFFFFF u32 LE][index_id u32 LE]`.
+pub fn composite_prefix(collection_id: u32, index_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + 4 + 4);
+    out.push(INDEX_TAG);
+    out.extend_from_slice(&collection_id.to_le_bytes());
+    out.extend_from_slice(&COMPOSITE_FIELD_MARKER.to_le_bytes());
+    out.extend_from_slice(&index_id.to_le_bytes());
+    out
+}
+
+/// Kodiert einen Composite-Index-Key:
+/// `[I][cid u32 LE][0xFFFFFFFF u32 LE][index_id u32 LE]`
+/// `[enc(c1)]...[enc(cn)][entity_id_len u32 LE][entity_id]`.
+///
+/// Jedes `components[i]` ist bereits ordnungserhaltend kodiert
+/// (`ordering::encode_ordered`); da diese Codierung selbst-delimitierend ist,
+/// bleibt die Konkatenation präfix-sortierbar — Range-Scans funktionieren.
+pub fn encode_composite_index_key(
+    collection_id: u32,
+    index_id: u32,
+    components: &[Vec<u8>],
+    entity_id: &[u8],
+) -> Vec<u8> {
+    let mut out = composite_prefix(collection_id, index_id);
+    for c in components {
+        out.extend_from_slice(c);
+    }
+    out.extend_from_slice(&(entity_id.len() as u32).to_le_bytes());
+    out.extend_from_slice(entity_id);
+    out
+}
+
 /// Kodiert einen Entity-Feld-Schlüssel.
 pub fn encode_entity_key(collection_id: u32, entity_id: &[u8], field_id: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + 4 + entity_id.len() + 4);

@@ -26,6 +26,16 @@ pub enum PhysicalPlan {
         lower: Bound,
         upper: Bound,
     },
+    /// Scan über einen READY-Composite-Index (v1.3). `field_ids` sind die
+    /// Felder des Index (in Reihenfolge), `leading` die gebundenen Komponenten
+    /// `(Positionsindex, Untergrenze, Obergrenze)`. Liefert **verifizierte**
+    /// Entity-IDs (der Index ist nie die Wahrheit).
+    CompositeIndexScan {
+        collection: String,
+        index_id: u32,
+        field_ids: Vec<String>,
+        leading: Vec<(usize, Bound, Bound)>,
+    },
     /// Scan über alle Entities einer Collection; liefert `(id, Entity)`.
     FullScan { collection: String },
     /// Geordneter Index-Scan (v0.6, Teil 3): streamt **verifizierte**
@@ -68,7 +78,8 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::FullScan { .. }
             | PhysicalPlan::IndexScan { .. }
-            | PhysicalPlan::IndexOrderScan { .. } => None,
+            | PhysicalPlan::IndexOrderScan { .. }
+            | PhysicalPlan::CompositeIndexScan { .. } => None,
             PhysicalPlan::UnionIds { .. } => None,
             PhysicalPlan::Fetch { input, .. }
             | PhysicalPlan::Filter { input, .. }
@@ -81,6 +92,7 @@ impl PhysicalPlan {
     pub fn kind(&self) -> &'static str {
         match self {
             PhysicalPlan::IndexScan { .. } => "IndexScan",
+            PhysicalPlan::CompositeIndexScan { .. } => "CompositeIndexScan",
             PhysicalPlan::IndexOrderScan { .. } => "IndexOrderScan",
             PhysicalPlan::FullScan { .. } => "FullScan",
             PhysicalPlan::UnionIds { .. } => "UnionIds",
@@ -96,6 +108,7 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::IndexScan { collection, .. }
             | PhysicalPlan::IndexOrderScan { collection, .. }
+            | PhysicalPlan::CompositeIndexScan { collection, .. }
             | PhysicalPlan::FullScan { collection }
             | PhysicalPlan::Fetch { collection, .. } => Some(collection),
             _ => None,

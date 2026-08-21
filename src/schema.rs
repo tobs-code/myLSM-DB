@@ -38,11 +38,15 @@ impl IndexStatus {
 }
 
 /// Definition eines Secondary Index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ein Single-Field-Index hat genau ein `field_ids`-Element; ein Composite-Index
+/// (v1.3) hat `field_ids.len() >= 2`. Das Feld-Set ist die stabile Identität
+/// eines Index (siehe `find_index` / `find_index_by_fields`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
     pub id: u32,
     pub collection_id: u32,
-    pub field_id: u32,
+    pub field_ids: Vec<u32>,
     pub status: IndexStatus,
 }
 
@@ -129,12 +133,21 @@ impl Schema {
         self.changed
     }
 
-    /// Registriert einen neuen Index (Status BUILDING) für (collection, field).
+    /// Registriert einen neuen Single-Field-Index (Status BUILDING) für
+    /// (collection, field).
     pub fn create_index(&mut self, collection_id: u32, field_id: u32) -> u32 {
+        self.create_composite_index(collection_id, &[field_id])
+    }
+
+    /// Registriert einen neuen Index (Status BUILDING) über ein Feld-Set. Bei
+    /// genau einem Feld entspricht das einem Single-Field-Index; ab zwei Feldern
+    /// einem Composite-Index (v1.3). Besteht bereits ein Index mit exakt dem
+    /// gleichen Feld-Set, wird dessen ID zurückgegeben (Idempotenz).
+    pub fn create_composite_index(&mut self, collection_id: u32, field_ids: &[u32]) -> u32 {
         if let Some(i) = self
             .indexes
             .iter()
-            .find(|i| i.collection_id == collection_id && i.field_id == field_id)
+            .find(|i| i.collection_id == collection_id && i.field_ids.as_slice() == field_ids)
         {
             return i.id;
         }
@@ -144,7 +157,7 @@ impl Schema {
         self.indexes.push(IndexDef {
             id,
             collection_id,
-            field_id,
+            field_ids: field_ids.to_vec(),
             status: IndexStatus::Building,
         });
         id
@@ -169,11 +182,23 @@ impl Schema {
         }
     }
 
-    /// Liefert den Index zu (collection, field), falls vorhanden.
+    /// Liefert den Single-Field-Index zu (collection, field), falls vorhanden.
     pub fn find_index(&self, collection_id: u32, field_id: u32) -> Option<&IndexDef> {
-        self.indexes
-            .iter()
-            .find(|i| i.collection_id == collection_id && i.field_id == field_id)
+        self.indexes.iter().find(|i| {
+            i.collection_id == collection_id && i.field_ids.len() == 1 && i.field_ids[0] == field_id
+        })
+    }
+
+    /// Liefert den Index zu einem exakten Feld-Set (Single- oder Composite),
+    /// falls vorhanden.
+    pub fn find_index_by_fields(
+        &self,
+        collection_id: u32,
+        field_ids: &[u32],
+    ) -> Option<&IndexDef> {
+        self.indexes.iter().find(|i| {
+            i.collection_id == collection_id && i.field_ids.as_slice() == field_ids
+        })
     }
 
     pub fn index_by_id(&self, id: u32) -> Option<&IndexDef> {
@@ -211,12 +236,22 @@ impl Schema {
         let mut indexes = self.indexes.clone();
         indexes.sort_by_key(|i| i.id);
         for i in &indexes {
+            // Neuformat: IX {id} {cid} {status} {nfields} {fid0} {fid1} ...
+            // (nfields entkoppelt das Neuformat vom Legacy-Format v1.0–v1.2
+            // `IX {id} {cid} {fid} {status}`, das nur zwei Rest-Tokens hat.)
+            let fields = i
+                .field_ids
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             buf.push_str(&format!(
-                "IX {} {} {} {}\n",
+                "IX {} {} {} {} {}\n",
                 i.id,
                 i.collection_id,
-                i.field_id,
-                i.status.code()
+                i.status.code(),
+                i.field_ids.len(),
+                fields
             ));
         }
         let tmp = path.with_extension("schema.tmp");
@@ -306,22 +341,47 @@ impl Schema {
                         .ok_or_else(|| Error::InvalidFormat("schema IX col".into()))?
                         .parse()
                         .map_err(|_| Error::InvalidFormat("schema IX col".into()))?;
-                    let f: u32 = parts
-                        .next()
-                        .ok_or_else(|| Error::InvalidFormat("schema IX field".into()))?
-                        .parse()
-                        .map_err(|_| Error::InvalidFormat("schema IX field".into()))?;
-                    let status = IndexStatus::from_code(
-                        parts
-                            .next()
-                            .ok_or_else(|| Error::InvalidFormat("schema IX status".into()))?,
-                    )?;
-                    s.indexes.push(IndexDef {
-                        id,
-                        collection_id: c,
-                        field_id: f,
-                        status,
-                    });
+                    // Rest-Tokens: Neuformat = [status, nfields, fid0, fid1, ...]
+                    // (>= 3 Tokens durch das nfields-Token); Legacy v1.0–v1.2 =
+                    // [fid, status] (genau 2 Tokens).
+                    let rest: Vec<&str> = parts.collect();
+                    if rest.len() == 2 {
+                        // Legacy: [fid, status]
+                        let f: u32 = rest[0]
+                            .parse()
+                            .map_err(|_| Error::InvalidFormat("schema IX field".into()))?;
+                        let status = IndexStatus::from_code(rest[1])?;
+                        s.indexes.push(IndexDef {
+                            id,
+                            collection_id: c,
+                            field_ids: vec![f],
+                            status,
+                        });
+                    } else if rest.len() >= 3 {
+                        // Neuformat: [status, nfields, fid0, fid1, ...]
+                        let status = IndexStatus::from_code(rest[0])?;
+                        let nfields: usize = rest[1]
+                            .parse()
+                            .map_err(|_| Error::InvalidFormat("schema IX nfields".into()))?;
+                        if rest.len() - 2 != nfields {
+                            return Err(Error::InvalidFormat("schema IX nfields mismatch".into()));
+                        }
+                        let mut field_ids = Vec::with_capacity(nfields);
+                        for tk in &rest[2..] {
+                            field_ids.push(
+                                tk.parse::<u32>()
+                                    .map_err(|_| Error::InvalidFormat("schema IX field".into()))?,
+                            );
+                        }
+                        s.indexes.push(IndexDef {
+                            id,
+                            collection_id: c,
+                            field_ids,
+                            status,
+                        });
+                    } else {
+                        return Err(Error::InvalidFormat("schema IX malformed".into()));
+                    }
                 }
                 _ => {}
             }
