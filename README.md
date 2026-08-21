@@ -1,10 +1,12 @@
 # myLSM-DB
 
-> ⚠️ **Work in Progress** — Dieses Projekt ist **noch nicht fertig** und befindet sich in aktiver Entwicklung. Die API und das Verhalten können sich jederzeit ändern. Nicht für Produktion geeignet.
+> **Stabiler Checkpoint `911c4c7` (v1.3, Composite Indexes).** Die API ist
+> eingefroren; siehe [`OPERATIONS.md`](./OPERATIONS.md) für Betriebsregeln und
+> bekannte Einsatzgrenzen.
 
 Eine kleine, eigenständige **LSM-Engine** (Log-Structured Merge Tree) in Rust — die Grundlage einer eigenen Datenbank, geschrieben von Grund auf.
 
-> **Das Ziel von v0.1:** eine zuverlässige Key-Value-Maschine, die `put`/`get`/`delete`/`scan` beherrscht, einen Write-Ahead-Log zur Crash-Recovery nutzt und SSTables kompaktiert. **Keine Entities, keine Query-Sprache, keine Indizes, keine Netzwerk-Schicht** — nur das solide Fundament.
+> **Ursprung (v0.1):** eine zuverlässige Key-Value-Maschine, die `put`/`get`/`delete`/`scan` beherrscht, einen Write-Ahead-Log zur Crash-Recovery nutzt und SSTables kompaktiert. Darauf aufbauend: Entity-Modell, Secondary- und Composite-Indexes, Query-Planner, atomare Transaktionen, CAS/Partial-Updates, Backup/Restore.
 
 ---
 
@@ -22,7 +24,13 @@ Eine kleine, eigenständige **LSM-Engine** (Log-Structured Merge Tree) in Rust �
 - [Verwendung](#verwendung)
 - [Tests](#tests)
 - [Bekannte Einschränkungen](#bekannte-einschränkungen)
+- [v1.0 — Admin-Tooling](#v10--admin-tooling)
+- [v1.1 — Backup / Restore](#v11--backup--restore)
+- [v1.2 — CAS / Partial Updates](#v12--cas--partial-updates)
+- [v1.3 — Composite Indexes](#v13--composite-indexes)
 - [Roadmap](#roadmap)
+- [Operations](#operations)
+- [Aktueller Status — v1.3 Freeze (`911c4c7`)](#aktueller-status--v13-freeze-911c4c7)
 
 ---
 
@@ -197,6 +205,15 @@ Atomar ersetzt (Temp-Datei + rename), damit nie ein halbes Manifest entsteht.
 | `builder.filter(pred)` / `.sort(field, dir)` / `.limit(n)` | v0.5: kettet Bedingungen an (jeweils `Self`). |
 | `store.execute_query(builder)?` | v0.5: führt den Plan aus, liefert `Vec<(String, Entity)>`. |
 | `store.explain_query(&builder)?` | v0.5: zeigt den geplanten Physical-Plan als Baum (String). |
+| `builder.project(&[&str])` | v0.5: schränkt die gelieferten Felder ein (Projektion). |
+| `store.execute_aggregate(builder)?` | v0.5: führt `Aggregate` aus (`Count`/`Sum`/`Avg`/`Min`/`Max`), liefert `Option<Value>`. |
+| `store.scan_collection(name)?` | v0.2: liefert alle Entities einer Collection (read-only). |
+| `store.get_entity(cid, &[u8])?` | Low-Level: Entity direkt per `collection_id` + Byte-ID. |
+| `col.create_composite_index(&[field])?` | v1.3: geordneter Composite-Index über mehrere Felder (auch mit Bestandsdaten, `BUILDING`→`READY`). |
+| `col.find_composite(&[field], &[(usize, Bound, Bound)])?` | v1.3: Bereichs-/Punkt-Abfrage über Composite-Index, liefert verifizierte `Vec<EntityId>`. |
+| `store.cas_update(coll, id, &Expected, &[Patch])?` | v1.2: Compare-and-Swap mit `Expected` (`Field`/`Any`/`Absent`/`Entity`) und `Patch` (`Set`/`Remove`/`Increment`). |
+| `store.backup(target_dir)?` | v1.1: konsistenter Verzeichnis-Snapshot (lokales Backup). |
+| `EntityStore::restore(backup_dir, target_dir)?` | v1.1: materialisiert einen Backup-Snapshot in ein neues Verzeichnis. |
 
 > **Hinweis zu `close()`:** Das ist der primäre Durability-Mechanismus für einen sauberen Shutdown. `drop(db)` ist nur ein **Best-Effort-Fallback** (flusht beim Verwerfen, ignoriert Fehler) — es ist keine Durability-Garantie. Rufe `close()` bewusst auf.
 
@@ -287,14 +304,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo test
 ```
 
-- **48 Unit-Tests** (WAL-Roundtrip/Recovery + Transaktions-Replay, MemTable, SSTable-Build/Read, Bloom, Manifest, Merge-Iterator, Compaction, Codec, Schema, Entity + Transactions, Index-Maintenance)
-- **6 Integrationstests** (`tests/engine.rs`): put/get/delete, Range-Scan, Flush + Compaction, WAL-Recovery, Recovery nach Flush+Compaction, Overwrite-Neueste-gewinnt, Tombstone-Verhalten.
-- **2 Crash-Tests** (`tests/crash.rs`): Clean-Close-Persistenz + Crash-Recovery ohne Korruption.
-- **1 Index-Oracle-Test** (`tests/index.rs`): 8000 zufällige Mutationen, `find` vs. Full-Scan identisch.
-- **1 Transaktions-Oracle-Test** (`tests/transaction.rs`): Random-Modell-Tester mischt commit/abort/crash/restart/index/entity und prüft get/scan/find gegen ein In-Memory-Modell.
-- **1 Query-Oracle-Test** (`tests/query.rs`): 200 zufällige Prädikate (AND/OR/NOT + 6 Vergleiche + fehlende Felder) werden gegen einen **Full-Scan** geprüft — Ausführung und Oracle teilen sich dieselbe `eval`-Semantik. Zusätzlich `basic_queries_match_oracle`, `missing_field_ne_vs_not_eq_consistent` und `explain_prints_tree`.
+- **Unit-Tests** (WAL-Roundtrip/Recovery + Transaktions-Replay, MemTable, SSTable-Build/Read, Bloom, Manifest, Merge-Iterator, Compaction, Codec, Schema, Entity + Transactions, Index-Maintenance, Query-Planner/Executor, CAS, Composite-Index)
+- **Integrationstests** (`tests/engine.rs`): put/get/delete, Range-Scan, Flush + Compaction, WAL-Recovery, Recovery nach Flush+Compaction, Overwrite-Neueste-gewinnt, Tombstone-Verhalten.
+- **Crash-Tests** (`tests/crash.rs`): Clean-Close-Persistenz + Crash-Recovery ohne Korruption.
+- **Index-Oracle-Test** (`tests/index.rs`): 8000 zufällige Mutationen, `find` vs. Full-Scan identisch.
+- **Transaktions-Oracle-Test** (`tests/transaction.rs`): Random-Modell-Tester mischt commit/abort/crash/restart/index/entity und prüft get/scan/find gegen ein In-Memory-Modell.
+- **Query-Oracle-Test** (`tests/query.rs`): zufällige Prädikate (AND/OR/NOT + 6 Vergleiche + fehlende Felder) gegen einen **Full-Scan** geprüft — Ausführung und Oracle teilen sich dieselbe `eval`-Semantik.
+- **Composite-Index-Test** (`tests/composite_index.rs`): Oracle-Test prüft `find_composite` vs. Full-Scan (inkl. Feldänderungen, Crash/Rebuild, Reopen).
+- **Phase-K-Usage** (`tests/phase_k_usage.rs`): Real-World-Harness (task/project-DB) — CRUD/CAS/Composite/Query/Aggregation/Transaktion/Backup-Restore, semantisch konsistent. Bleibt **untracked** (Validierungs-Harness, kein Produktions-Test).
 
-> **Gesamt: 64 Tests grün.** Die Ausführungs-Orchestrierung (`tests/index.rs`, `tests/transaction.rs`, `tests/query.rs`) dauert im Debug-Modus mehrere Minuten (Volle Full-Scan-Oracle).
+> **Vollständige Suite grün:** `cargo test` läuft über alle oben genannten Suites hinweg fehlerfrei (Unit- + Integrations-Tests). Die Oracle-Ausführung dauert im Debug-Modus einige Minuten (Voller Full-Scan-Vergleich).
 
 ---
 
@@ -307,6 +326,8 @@ cargo test
 - Bloom-Filter sind fest auf `1024` Bit gesetzt, nicht an die Datenmenge angepasst.
 - Der `TableCache` hält Reader im RAM; bei sehr vielen Tabellen wächst er entsprechend.
 - **`limit` ohne `sort` ist undefiniert** (v0.5): Nur mit `sort` ist die Reihenfolge der Ergebniszeilen und damit `limit` deterministisch.
+- **Bulk-Load mit vielen Indexen ist bewusst nicht optimiert** (Phase-K-Befund, C-Kandidat): die Indexpflege läuft synchron pro Entity. Große Bulk-Loads können entsprechend langsam werden. Siehe [`OPERATIONS.md`](./OPERATIONS.md).
+- **Betriebsgrenzen (Single-Handle, Durability-Grenzen, Concurrency)** sind in [`OPERATIONS.md`](./OPERATIONS.md) zusammengefasst.
 
 ---
 
@@ -646,6 +667,92 @@ Der Kern des Storage-Read-Pfads ist nach den Fixes bei 100k gesund: kein Grund, 
 
 ---
 
+## v1.0 — Admin-Tooling
+
+Operationales Werkzeug rund um Schema und Collections: Collection- und Feld-IDs
+sind stabil persistent (`schema.rs`); Admin-Aufrufe erlauben Inspektion und
+gezielte Wartung, ohne die Storage-Engine umzubauen. (Details sind im
+Commit-Verlauf von `911c4c7` nachvollziehbar.)
+
+---
+
+## v1.1 — Backup / Restore
+
+Lokaler, konsistenter Verzeichnis-Snapshot:
+
+```rust
+store.backup("./backup")?;                       // Snapshot von dir_a
+// Weiterarbeit auf dem Original verfälscht den Snapshot nicht.
+EntityStore::restore("./backup", "./restored")?; // neues Verzeichnis
+let restored = EntityStore::open("./restored")?;
+```
+
+`backup` kopiert den konsistenten Zustand zum Aufrufzeitpunkt; nachträgliche
+Writes auf der Quelle beeinflussen den Snapshot nicht. Remote-Backup ist
+Host/Infra-Sache, nicht Teil der Library. Siehe [`OPERATIONS.md`](./OPERATIONS.md).
+
+---
+
+## v1.2 — CAS / Partial Updates
+
+Compare-and-Swap mit结构性 Patching — atomar über die Entity, ohne die ganze
+Entity neu schreiben zu müssen:
+
+```rust
+use my_lsm_db::entity::{Expected, Patch};
+
+store.cas_update(
+    "tasks", "t-1",
+    &Expected::Field("status".into(), Value::String("todo".into())),
+    &[
+        Patch::Set("status".into(), Value::String("doing".into())),
+        Patch::Increment("priority".into(), Value::Int(1)),
+    ],
+)?;
+```
+
+`Expected` varianten: `Field` (Wert muss passen), `Any` (Entity muss existieren),
+`Absent` (darf nicht existieren), `Entity` (ganze Entity muss matchen). Ein
+misslungener Vergleich liefert einen Fehler, die Entity bleibt unverändert —
+Contention wird sauber zurückgewiesen.
+
+---
+
+## v1.3 — Composite Indexes
+
+Geordnete Indexe über **mehrere Felder** (`(project_id, status)`,
+`(status, priority)`, …). Ein Composite-Eintrag ist selbst wieder
+order-preserving, sodass Bereichs- und Punkt-Abfragen über Präfixe möglich sind:
+
+```rust
+store.collection("tasks")?.create_composite_index(&["project_id", "status"])?;
+
+let ids = store.collection("tasks")?.find_composite(
+    &["project_id", "status"],
+    &[
+        (0, Bound::Inclusive(Value::String("p2".into())), Bound::Inclusive(Value::String("p2".into()))),
+        (1, Bound::Inclusive(Value::String("doing".into())), Bound::Inclusive(Value::String("doing".into()))),
+    ],
+)?;
+```
+
+**Invarianten (aus `design-v1.3-composite-index.md`):**
+- Die Entity bleibt Source of Truth; `find_composite` verifiziert jeden
+  Kandidaten gegen die echte Entity (keine False Negatives).
+- `find_composite_m` re-verifiziert zusätzlich jede Leading-Component gegen die
+  tatsächliche Entity, damit nach einer Feldänderung keine veralteten
+  Composite-Einträge durchsickern.
+- Index-Aufbau läuft `BUILDING`→`READY` (fsync an beiden Punkten); ein Crash
+  während des Builds hinterlässt `BUILDING` → beim nächsten `open` vollständig
+  neu aufgebaut (idempotent). Der Planner schließt `BUILDING`-Indizes von der
+  Nutzung aus.
+
+**Bewusste Grenze:** `ORDER BY` über einen Composite-Index ist nicht
+implementiert (nur Single-Field `IndexOrderScan`); Composite-Abfragen liefern
+unsortiert. Das ist eine C-Optimierung, kein Correctness-Problem.
+
+---
+
 ## Roadmap
 
 | Version | Inhalt |
@@ -661,76 +768,64 @@ Der Kern des Storage-Read-Pfads ist nach den Fixes bei 100k gesund: kein Grund, 
 | **v0.6** -fertig- | Query-Ausführung, Tx-Queries, Cost-Based Indexwahl, Index-Order / Top-K |
 | **v0.7.1** -fertig- | **Lazy-Read-Komplexität:** `memtable_source` materialisiert nur den angefragten Range (`BTreeMap::range`), Empty-Range-Guard — behebt O(N²) beim Entity-Aufbau |
 | **v0.7.2** -fertig- | **Lazy-Read-Komplexität:** `scan_stream` nutzt den `table_cache`, `TableReader::fork()`/`Arc`-Reader-Sharing — behebt O(N²) bei vielen SSTables |
+| **v1.0** -fertig- | Admin-Tooling: Schema-/Collection-Inspektion und Wartung |
+| **v1.1** -fertig- | Backup / Restore: lokaler konsistenter Verzeichnis-Snapshot |
+| **v1.2** -fertig- | CAS / Partial Updates: `Expected` + `Patch`, atomar über die Entity |
+| **v1.3** -fertig- | Composite Indexes: geordnete Multi-Feld-Indexe, Entity-verifiziert |
 
 Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist in [`konzept-kombination.md`](../konzept-kombination.md) beschrieben.
 
 ---
 
-## Aktueller Status — Stand Handover-Audit (2026-08-20)
+## Aktueller Status — v1.3 Freeze (`911c4c7`)
 
-> Kanonische Referenzen (siehe `design-v0.7-compaction-v2.md`):
+> **Produkt-Freeze.** `911c4c7` ist der stabile v1.x-Checkpoint und == `origin/main`.
+> Phase K (Real-World-Validation) bestätigte: **0 A-Findings**, alle Workflows
+> (CRUD / CAS / Partial Updates / Composite-Queries / Aggregation / Transaktion /
+> Backup-Restore) semantisch konsistent. Keine v1.4-Roadmap ohne konkreten Bedarf.
 
-| Referenz | Bedeutung |
-|---|---|
-| `d6d5916` | **Produktionsbaseline** — unverändert, kein produktiver Code von diesem Stand abgewichen |
-| `6b65191` | **Diagnose-Freeze v0.9/v0.10** — v0.10 Field-Projection untersucht und verworfen (Real-Workload: 3–4 Felder/Entity, 100 % Full-Reads) |
-| `cf382ca` | **Handover-Audit** — Vorgänger-LLM-Arbeit übernommen und klassifiziert (§27–§28) |
+**Kanonische Dokumentation:**
+- Architektur/Spezifikation v1.3: `design-v1.3-composite-index.md`
+- Betriebsregeln & Einsatzgrenzen: [`OPERATIONS.md`](./OPERATIONS.md)
 
-**Abgeschlossene Diagnosekette (eigene Linie):**
-- **v0.9 → v0.9a → v0.9b:** Read-Hotspot lokalisiert (`get` = 82 % der Read-Kosten, skaliert mit Feldanzahl).
-- **v0.10:** Field-Projection-Prototyp gebaut (G1–G8 Korrektheitsgates grün), aber **wirtschaftlich verworfen** — isolierter Gewinn nur bei `requested_fields << entity_fields`; im realen Traffic (volle Reads) langsamer als `get`.
+**Versionslinie (abgeschlossen):**
 
-**Handover-Audit der Vorgänger-Arbeit (§27–§28):**
-- `value_cache` (v0.7-write-cache): technisch korrekt (Oracle-Tests grün, Invalidation vollständig), aber **isoliert 0–11 % Cache-Effekt** im non-tx Write-Pfad → wirtschaftlich nicht relevant, kein Produktionskandidat.
-- `compaction_v2` (12/12 Regressionstests): testet exakt die `d6d5916`-Compaction-Architektur, keine neue Logik.
-- `diag.rs` + `bench.rs`: funktionierende Diagnose-Infrastruktur, keine Produktionskopplung.
-- `bench-ir*`, `bench-v2`, `bench-v8`: historische Klasse-C-Artefakte (aktuell wegen fehlender Feature-Definitionen nicht baubar).
+```text
+v0.8  Query/Aggregation/Projection
+v0.9  Format-Versionierung
+v1.0  Admin-Tooling
+v1.1  Backup/Restore
+v1.2  CAS/Partial Updates
+v1.3  Composite Indexes
+Phase K  Real-World-Validation (911c4c7)
+```
 
-**Invarianten:**
-- `d6d5916` bleibt Produktionsbaseline.
-- Kein Produktions-Merge aus der Diagnose/aus dem Audit.
-- Nächster Sprint erst bei **neuem konkreten Befund**, nicht vorab als "v0.11" deklariert.
-- Vorgänger-Working-Tree (modifizierte `src/`-Dateien, temporäre Artefakte) bleibt bewusst unangetastet.
+**Freigegebene Produkteigenschaften:** vollständige Query-/Mutation-/Ops-Fläche,
+dokumentierter Durability-Vertrag (transaktional durable nach `commit()`,
+Direct-Writes deferred-durable nach `flush()`/`close()`/`backup()`), Crash-Recovery
+über WAL-Replay inkl. transaktionalem Replay.
+
+**Offene Befunde:** **keine** A/B-Correctness-/Durability-Befunde. Einziger
+technischer Befund aus Phase K: Bulk-Load wird durch synchrone Indexpflege pro
+Entity dominiert (C-Performance-Backlog, kein Correctness-Problem, keine
+zugesagte v1.4-Arbeit). Details in [`OPERATIONS.md`](./OPERATIONS.md).
+
+**Regel:** Kein neuer technischer Zweig ohne konkreten neuen Befund (realer
+Nutzerbedarf oder reproduzierbarer A-/B-Befund). Nächster Zyklus dann nach dem
+bewährten Verfahren: **Befund → Forensik → Regression/Oracle → minimaler Fix →
+Volltest → Checkpoint → Push.**
 
 ---
 
-## Produktions-Handover-Checkpoint — `0e62b6e` (2026-08-20)
+## Operations
 
-> Abschluss der Correctness-/Recovery-/GC-/Durability-Diagnose. **Kein offener
-> technischer Arbeitsauftrag.** Nächster Zweig ausschließlich bei neuem realem
-> Befund. `0e62b6e` ist die **aktuelle Code-Baseline** (superseded `d6d5916`
-> für die aktive Linie) und == `origin/main`.
+Siehe [`OPERATIONS.md`](./OPERATIONS.md) für:
 
-**Kanonische Details:** `design-v0.7-compaction-v2.md` §30.9–§30.12.
-
-**Abgeschlossene Zweige (Design-Doc + Commit-History nachvollziehbar):**
-- **E.8** — Compaction-Correctness: `merge_ids`/`table_bounds` propagieren
-  Lese-/Iter-Fehler; `compact()` bricht vor `manifest.save` ab statt stillen
-  Datenverlusts. (`e9a5f80`, `tests/merge_ids_fault.rs`)
-- **E.10** — Orphan-GC: `db.gc()` (explizit, `&mut self`, **kein** Auto-GC beim
-  Open) räumt unreferenzierte `*.sst` + `.manifest.tmp` auf.
-  (`33b6a98` + `5ebc9ce`, `tests/orphan_gc.rs`)
-- **F.3–F.5** — Manifest-`L`-Zeilen-Parsing strikt: korrupter ID-Token in
-  `L`-Zeile → `InvalidFormat` statt stillem Datenverlust.
-  (`0725057`, `tests/manifest_corruption.rs`)
-- **F-WAL** — WAL-Durability-Audit: kein Correctness-Bug, kein
-  Vertragsbruch; deferred durability explizit dokumentiert. (`0e62b6e`, §30.12)
-
-**Bewusste Designentscheidungen (kein Fix nötig):**
-- Direct `put`/`delete`: **deferred durability** — nicht durable beim Return,
-  durable nach `flush()`/`close()`. Transaktionen durable nach `commit()`
-  (per-commit `fsync`). **Kein** `fsync` pro Direct-Write ( Performance-/Architektur-Entscheidung, kein Bug).
-- `MANIFEST` atomar (tmp + `sync_all` + rename); `L0`/Segmente werden vor
-  deren Löschung committet (Crash-Fenster erzeugen nur harmlose Orphans).
-- `merge_ids`/`table_bounds` brechen bei unlesbarer manifestierter SSTable ab
-  (kein stiller Datenverlust mehr).
-- `gc()` nur explizit, id-basiert; rührt Manifest/Compaction nicht an.
-
-**Offene Befunde:** **keine** A/B-Correctness-/Durability-Befunde. Performance-
-Themen (WAL-fsync, Reader-Cache, Compaction-Strategie) bewusst nicht
-angetastet — kein nachgewiesener Nutzen.
-
-**Regel:** Kein neuer technischer Zweig ohne konkreten neuen Befund. Bei realem
-Workload (get / Entity-Put / Compaction / Speicherverbrauch) startet daraus der
-nächste Zyklus: **Befund → Forensik → Regression → minimaler Fix → Volltest → Push.**
+- **Single-Handle-Regel:** ein aktiver `EntityStore` pro DB-Verzeichnis.
+- **Durability:** Direct Writes deferred-durable; `flush()`/`close()`/`backup()`
+  als Persistenzgrenzen.
+- **Bulk-Load:** synchrone Indexpflege kann bei großen Bulk-Loads langsam werden.
+- **Backup/Restore:** sichere Betriebsweise (lokaler Snapshot).
+- **Concurrency-Grenze:** kein Cross-Process-Locking / Multi-Writer.
+- **Backlog:** `Bulk Index Build` als C-Kandidat (keine v1.4-Verpflichtung).
 
