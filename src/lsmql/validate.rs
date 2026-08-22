@@ -141,8 +141,17 @@ fn validate_pred(schema: &Schema, coll_id: u32, coll: &str, p: &Predicate) -> Ls
             }
             Ok(())
         }
-        Predicate::IsNull(f) | Predicate::IsAbsent(f) => {
+        Predicate::IsNull(f) => {
             check_field(schema, coll_id, coll, f)?;
+            Ok(())
+        }
+        Predicate::IsAbsent(f) => {
+            // IS ABSENT ist in v1 AST-reserviert (siehe translate.rs: der
+            // Translator liefert UnsupportedQuery). Die Feld-Existenzprüfung
+            // ist hier wirkungslos — wir überspringen sie bewusst, damit das
+            // Unsupported-Signal (→422) durchkommt statt eines falschen
+            // UnknownField (→400).
+            let _ = f;
             Ok(())
         }
     }
