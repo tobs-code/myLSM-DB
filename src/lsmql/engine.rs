@@ -18,7 +18,12 @@ use crate::lsmql::validate::validate;
 #[derive(Debug, Clone)]
 pub enum QueryResult {
     /// Zeilen-Ergebnis (`SELECT ...`, keine Aggregation).
-    Rows(Vec<(String, crate::entity::Entity)>),
+    Rows(
+        Vec<(
+            String,
+            std::collections::HashMap<String, crate::codec::Value>,
+        )>,
+    ),
     /// Skalar-Ergebnis (`SELECT COUNT(*)` etc.).
     Scalar(Option<crate::codec::Value>),
 }
@@ -56,16 +61,24 @@ pub fn run(
             })?;
         Ok(QueryResult::Scalar(res))
     } else {
-        let rows = store
-            .execute_query(builder)
-            .map_err(|e| LsmqlError::Execution {
-                message: e.to_string(),
-            })?;
-        // OFFSET anwenden (QueryBuilder kennt kein Offset; wir skippen hier).
-        let rows = if q.offset > 0 {
-            rows.into_iter().skip(q.offset).collect()
+        let raw: Vec<(String, crate::entity::Entity)> =
+            store
+                .execute_query(builder)
+                .map_err(|e| LsmqlError::Execution {
+                    message: e.to_string(),
+                })?;
+        let rows: Vec<(
+            String,
+            std::collections::HashMap<String, crate::codec::Value>,
+        )> = if q.offset > 0 {
+            raw.into_iter()
+                .skip(q.offset)
+                .map(|(id, e)| (id, entity_to_map(e)))
+                .collect()
         } else {
-            rows
+            raw.into_iter()
+                .map(|(id, e)| (id, entity_to_map(e)))
+                .collect()
         };
         Ok(QueryResult::Rows(rows))
     }
@@ -153,4 +166,14 @@ fn db_value_to_lsmql(v: crate::codec::Value) -> Value {
         crate::codec::Value::Null => Value::Null,
         crate::codec::Value::Bytes(_) => Value::Null,
     }
+}
+
+fn entity_to_map(
+    e: crate::entity::Entity,
+) -> std::collections::HashMap<String, crate::codec::Value> {
+    let mut m = std::collections::HashMap::new();
+    for (k, v) in e.fields {
+        m.insert(k, v);
+    }
+    m
 }

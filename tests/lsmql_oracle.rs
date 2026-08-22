@@ -1,4 +1,4 @@
-//! LSMQL Oracle (30-Query-Matrix-Slice).
+//! LSMQL Oracle (30-Query-Matrix-Slice) — Consumer-tauglich.
 //!
 //! Stützt sich auf `docs/design-lsmql.md` §9. Prüft Pipeline:
 //! Lexer → Parser → Semantic Validation → QueryBuilder → Execution.
@@ -40,7 +40,7 @@ fn task_with_null(title: &str, status: &str) -> Entity {
             ("status".into(), Value::String(status.into())),
             ("priority".into(), Value::Int(1)),
             ("project_id".into(), Value::String("p1".into())),
-            ("assignee".into(), Value::Null), // explizit NULL
+            ("assignee".into(), Value::Null),
         ],
     }
 }
@@ -122,13 +122,10 @@ fn oracle_is_null_vs_absent() {
     let dir = TempDir::new().unwrap();
     let mut store = EntityStore::open(dir.path()).unwrap();
     let mut col = store.collection("tasks").unwrap();
-    // t1: assignee fehlt komplett (absent)
     let mut e1 = task("A", "todo", 2, Some("Tobias"), "p1", Some(3));
     e1.fields.retain(|(n, _)| n != "assignee");
     col.put("t1", &e1).unwrap();
-    // t2: assignee ist explizit NULL
     col.put("t2", &task_with_null("B", "todo")).unwrap();
-    // t3: assignee ist "Anna"
     col.put("t3", &task("C", "todo", 1, Some("Anna"), "p1", None))
         .unwrap();
 
@@ -139,7 +136,7 @@ fn oracle_is_null_vs_absent() {
     )
     .unwrap();
     match res_null {
-        lsmql::QueryResult::Rows(rows) => assert_eq!(rows.len(), 1), // nur t2
+        lsmql::QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
         _ => panic!("expected rows"),
     }
 }
