@@ -53,6 +53,7 @@ pub mod error;
 pub mod index;
 pub mod iterator;
 pub mod keycodec;
+pub mod lsmql;
 pub mod manifest;
 pub mod memtable;
 pub mod ordering;

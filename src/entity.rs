@@ -1231,6 +1231,13 @@ impl EntityStore {
         let physical = query::planner::plan(&self.schema, logical);
         Ok(query::explain::format(&physical))
     }
+
+    /// Lesender Zugriff auf das Schema (für Schema-gestützte Validierung,
+    /// z.B. durch Query-Sprachen wie LSMQL). Reine Referenz, keine
+    /// Schema-Änderung — respektiert den read-only-Vertrag der Query-API.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 impl<'a> Transaction<'a> {
