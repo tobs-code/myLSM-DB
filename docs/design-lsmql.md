@@ -322,14 +322,22 @@ der Planner entscheidet *wie* — und `EXPLAIN` macht beides transparent.
 | Fehler                  | Trigger                                | HTTP (taskdb) |
 |-------------------------|---------------------------------------|---------------|
 | `ParseError`            | ungültige Syntax                      | 400           |
-| `UnknownCollection`     | `FROM <x>` nicht im Schema            | 404           |
+| `UnknownCollection`     | `FROM <x>` nicht im Schema            | **400**¹      |
 | `UnknownField`          | Feld nicht auf Collection definiert   | 400           |
-| `TypeMismatch`          | Operator vs. Wertetyp                 | 422           |
+| `TypeMismatch`          | Operator vs. Wertetyp                 | **400**¹      |
 | `UnboundParameter`      | `$x` nicht in `params`                | 400           |
 | `UnsupportedQuery`      | `GROUP BY` in v1, etc.                | 422           |
 
-Fehler sind strukturiert: `{ "error": "<kind>", "message": "...", "span"?:
-[line,col] }`. Kein Panic, keine DB-weite Exception.
+¹ **Korrektur (v1.4):** Die ursprüngliche Spec sah hier 404/422 vor. Der
+gebautelte taskdb-HTTP-Vertrag (`src/server.rs::map_err`) mappt alle
+`LsmqlError::Semantic`-Varianten (inkl. `UnknownCollection`,
+`TypeMismatch`) auf **400** und `LsmqlError::Unsupported` auf **422**.
+Der taskdb-Vertrag ist die binding authority für HTTP-Status. Alle
+`Semantic`-Fehler sind Client-Eingabefehler → 400; `Unsupported` ist ein
+definierter "bekannt, aber in v1.4 nicht verfügbar"-Zustand → 422.
+
+Fehler sind strukturiert: `{ "error": "<kind>", "message": "..." }`. Kein
+Panic, keine DB-weite Exception.
 
 ---
 
