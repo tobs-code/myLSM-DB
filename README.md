@@ -1,6 +1,6 @@
 # myLSM-DB
 
-> **Release `v1.3.0`** (Tag `v1.3.0`, Commit `758cfd1`) — veröffentlicht auf
+> **Release `v1.4.0`** (Tag `v1.4.0`, Commit `8339114`) — veröffentlicht auf
 > [crates.io](https://crates.io/crates/my-lsm-db). Die API ist eingefroren
 > (Post-Release-Baseline); siehe [`OPERATIONS.md`](./OPERATIONS.md) für
 > Betriebsregeln und bekannte Einsatzgrenzen.
@@ -778,12 +778,11 @@ Das Gesamtkonzept (LSM-Engine + Entity-Modell + Indexes + Query-Optimizer) ist i
 
 ---
 
-## Aktueller Status — v1.3 Freeze (`911c4c7`)
+## Aktueller Status — v1.4.0 (`8339114`)
 
-> **Produkt-Freeze.** `911c4c7` ist der stabile v1.x-Checkpoint und == `origin/main`.
-> Phase K (Real-World-Validation) bestätigte: **0 A-Findings**, alle Workflows
-> (CRUD / CAS / Partial Updates / Composite-Queries / Aggregation / Transaktion /
-> Backup-Restore) semantisch konsistent. Keine v1.4-Roadmap ohne konkreten Bedarf.
+> **Post-Release-Baseline.** `8339114` ist der stabile v1.4-Checkpoint und == `origin/main`.
+> Phase L (LSMQL Release-Hardening) bestätigte: **28/28 LSMQL-Oracle-Tests grün**, **10/10 taskdb-HTTP-Vertragstests grün**, Release-Build + Docs grün.
+> LSMQL ist jetzt die stabile read-only Query-Schnittstelle.
 
 **Kanonische Dokumentation:**
 - Architektur/Spezifikation v1.3: `design-v1.3-composite-index.md`
@@ -798,7 +797,9 @@ v1.0  Admin-Tooling
 v1.1  Backup/Restore
 v1.2  CAS/Partial Updates
 v1.3  Composite Indexes
+v1.4  LSMQL Read-Only Query Interface
 Phase K  Real-World-Validation (911c4c7)
+Phase L  LSMQL Release-Hardening (8339114)
 ```
 
 **Freigegebene Produkteigenschaften:** vollständige Query-/Mutation-/Ops-Fläche,
