@@ -1,8 +1,9 @@
 # myLSM-DB
 
-> **Stabiler Checkpoint `911c4c7` (v1.3, Composite Indexes).** Die API ist
-> eingefroren; siehe [`OPERATIONS.md`](./OPERATIONS.md) für Betriebsregeln und
-> bekannte Einsatzgrenzen.
+> **Release `v1.3.0`** (Tag `v1.3.0`, Commit `758cfd1`) — veröffentlicht auf
+> [crates.io](https://crates.io/crates/my-lsm-db). Die API ist eingefroren
+> (Post-Release-Baseline); siehe [`OPERATIONS.md`](./OPERATIONS.md) für
+> Betriebsregeln und bekannte Einsatzgrenzen.
 
 Eine kleine, eigenständige **LSM-Engine** (Log-Structured Merge Tree) in Rust — die Grundlage einer eigenen Datenbank, geschrieben von Grund auf.
 
