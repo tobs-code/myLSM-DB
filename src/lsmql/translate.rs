@@ -53,7 +53,7 @@ pub fn to_builder(q: &Query) -> LsmqlResult<QueryBuilder> {
                 .collect();
             if !aggs.is_empty() {
                 // Aggregation ist der Terminal-Schritt.
-                if aggs.len() != 1 || fields.is_empty() == false {
+                if aggs.len() != 1 || !fields.is_empty() {
                     // v0.8: Aggregation exklusiv zu Projektion.
                     // Wir erlauben nur rein-aggregierende Projektionen.
                     if !fields.is_empty() {
@@ -85,7 +85,13 @@ fn to_pred(e: &Expr) -> LsmqlResult<DbPred> {
                 feature: "empty AND".into(),
                 reason: "parser should not produce this".into(),
             })?)?;
-            Ok(iter.fold(first, |acc, s| acc.and(to_pred(s).unwrap())))
+            // Unter-Prädikate dürfen `Unsupported` liefern (z.B. IS ABSENT
+            // verschachtelt) — das muss sauber durchgereicht werden.
+            let mut acc = first;
+            for s in iter {
+                acc = acc.and(to_pred(s)?);
+            }
+            Ok(acc)
         }
         Expr::Or(subs) => {
             let mut iter = subs.iter();
@@ -93,7 +99,11 @@ fn to_pred(e: &Expr) -> LsmqlResult<DbPred> {
                 feature: "empty OR".into(),
                 reason: "parser should not produce this".into(),
             })?)?;
-            Ok(iter.fold(first, |acc, s| acc.or(to_pred(s).unwrap())))
+            let mut acc = first;
+            for s in iter {
+                acc = acc.or(to_pred(s)?);
+            }
+            Ok(acc)
         }
         Expr::Not(b) => Ok(to_pred(b)?.negate()),
         Expr::Pred(p) => to_atom(p),

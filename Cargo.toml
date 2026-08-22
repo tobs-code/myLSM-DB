@@ -1,6 +1,6 @@
 [package]
 name = "my-lsm-db"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2024"
 description = "A small embedded LSM key-value database with a typed entity layer, CAS, transactions, composite indexes, queries/aggregates, and backup/restore."
 license = "MIT"
