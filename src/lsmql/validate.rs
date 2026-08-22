@@ -83,6 +83,9 @@ fn collect_numeric_fields() -> std::collections::HashSet<String> {
 }
 
 fn check_field(schema: &Schema, coll_id: u32, coll: &str, field: &str) -> LsmqlResult<()> {
+    if field == "id" {
+        return Ok(());
+    }
     if schema.lookup_field_id(coll_id, field).is_none() {
         return Err(LsmqlError::Semantic(SemanticError::UnknownField {
             collection: coll.to_string(),
